@@ -10,7 +10,7 @@ export class SseParser {
       if (!line) break;
       this.pending = this.pending.subarray(line.bytes);
       const content = line.content.toString('utf8');
-      if (content === '') { const event = this.finishEvent(); if (event) events.push(event); }
+      if (content === '') { if (this.eventBytes.length) this.eventBytes.push(line.raw); const event = this.finishEvent(); if (event) events.push(event); }
       else if (!content.startsWith(':')) { this.eventLines.push(content); this.eventBytes.push(line.raw); }
       else this.eventBytes.push(line.raw);
     }

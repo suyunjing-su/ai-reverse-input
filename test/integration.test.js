@@ -19,7 +19,7 @@ test('non-stream Responses retries matching JSON error and returns only success'
 test('SSE early failure is discarded and successful attempt is delivered', async () => {
   let attempts = 0; const delivered = []; const response = () => { attempts++; return attempts === 1 ? responseFromChunks(200, ['event: response.created\n\ndata: {"type":"response.created"}\n\n', 'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"busy","message":"later"}}}\n\n']) : responseFromChunks(200, ['event: response.created\n\ndata: {"type":"response.created"}\n\n', 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n', 'event: response.completed\ndata: {"type":"response.completed"}\n\n']); };
   await executeResponseRequest({ request: { stream: true }, config: retryConfig, clientSignal: new AbortController().signal, upstream: async () => response(), sendStream: async (_response, prefix, rest, _signal, iterator) => { for (const chunk of prefix) delivered.push(chunk.toString()); if (rest?.length) delivered.push(rest.toString()); for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) delivered.push(chunk.toString()); } });
-  assert.equal(attempts, 2); assert.equal(delivered.some((item) => item.includes('response.failed')), false); assert.equal(delivered.some((item) => item.includes('"delta":"ok"')), true);
+  assert.equal(attempts, 2); assert.equal(delivered.some((item) => item.includes('response.failed')), false); assert.equal(delivered.some((item) => item.includes('"delta":"ok"')), true); assert.match(delivered.join(''), /response\.created[\s\S]*\n\n[\s\S]*response\.output_text\.delta/);
 });
 
 test('SSE preflight deadline commits without waiting for the next event', async () => {
