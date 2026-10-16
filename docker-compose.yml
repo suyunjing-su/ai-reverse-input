@@ -1,0 +1,18 @@
+services:
+  reserve-input-gateway:
+    build: .
+    ports:
+      - "127.0.0.1:${PORT:-8787}:8787"
+    environment:
+      NEW_API_BASE_URL: ${NEW_API_BASE_URL:?set NEW_API_BASE_URL}
+      HOST: 0.0.0.0
+      PORT: 8787
+      DATA_DIR: /app/data
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD on first start}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+    volumes:
+      - gateway-data:/app/data
+    restart: unless-stopped
+volumes:
+  gateway-data:

@@ -1,0 +1,14 @@
+{
+  "name": "new-api-reserve-input-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Transparent New API reverse proxy with model prompts and Responses retries",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test",
+    "check": "node --check src/server.js && node --check src/proxy.js && node --check src/protocols/prompt-injection.js && node --check src/retry/sse-parser.js && node --check src/retry/responses-retry.js"
+  }
+}
