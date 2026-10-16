@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 
 const DEFAULT_RETRY = {
-  enabled: false, codeRules: [], messageRules: [], maxRetries: 2,
+  enabled: false, statusRules: [], codeRules: [], messageRules: [], maxRetries: 2,
   baseDelayMs: 250, exponentialBackoff: true, maxDelayMs: 5000,
   totalTimeoutMs: 30000, preflightBytes: 262144, preflightMs: 10000,
 };
@@ -57,11 +57,12 @@ function normalizeConfig(input, fallback) {
   return {
     version: 1, upstreamUrl: typeof source.upstreamUrl === 'string' ? source.upstreamUrl : fallback.upstreamUrl,
     promptRules: Array.isArray(source.promptRules) ? source.promptRules.filter(validPromptRule).map((r) => ({ id: r.id || crypto.randomUUID(), modelId: r.modelId, prompt: r.prompt, enabled: Boolean(r.enabled), createdAt: r.createdAt || new Date().toISOString(), updatedAt: r.updatedAt || new Date().toISOString(), hits: Number(r.hits) || 0 })) : [],
-    retry: { ...(fallback.retry || DEFAULT_RETRY), ...retry, codeRules: normalizeErrorRules(retry.codeRules), messageRules: normalizeErrorRules(retry.messageRules), maxRetries: integerBetween(retry.maxRetries, 0, 10, 2), baseDelayMs: integerBetween(retry.baseDelayMs, 0, 60000, 250), maxDelayMs: integerBetween(retry.maxDelayMs, 0, 300000, 5000), totalTimeoutMs: integerBetween(retry.totalTimeoutMs, 100, 3600000, 30000), preflightBytes: integerBetween(retry.preflightBytes, 1024, 16 * 1024 * 1024, 262144), preflightMs: integerBetween(retry.preflightMs, 100, 120000, 10000), enabled: Boolean(retry.enabled), exponentialBackoff: retry.exponentialBackoff !== false },
+    retry: { ...(fallback.retry || DEFAULT_RETRY), ...retry, statusRules: normalizeStatusRules(retry.statusRules ?? fallback.retry?.statusRules), codeRules: normalizeErrorRules(retry.codeRules), messageRules: normalizeErrorRules(retry.messageRules), maxRetries: integerBetween(retry.maxRetries, 0, 10, 2), baseDelayMs: integerBetween(retry.baseDelayMs, 0, 60000, 250), maxDelayMs: integerBetween(retry.maxDelayMs, 0, 300000, 5000), totalTimeoutMs: integerBetween(retry.totalTimeoutMs, 100, 3600000, 30000), preflightBytes: integerBetween(retry.preflightBytes, 1024, 16 * 1024 * 1024, 262144), preflightMs: integerBetween(retry.preflightMs, 100, 120000, 10000), enabled: Boolean(retry.enabled), exponentialBackoff: retry.exponentialBackoff !== false },
     metrics: { ...fallback.metrics, ...(source.metrics || {}) },
   };
 }
 function validPromptRule(r) { return r && typeof r.modelId === 'string' && r.modelId.length > 0 && r.modelId.length <= 512 && typeof r.prompt === 'string'; }
+function normalizeStatusRules(rules) { return Array.isArray(rules) ? rules.map((rule) => ({ id: rule?.id || crypto.randomUUID(), status: Number(rule?.status ?? rule?.value), enabled: rule?.enabled !== false })).filter((rule) => Number.isInteger(rule.status) && rule.status >= 400 && rule.status <= 599) : []; }
 function normalizeErrorRules(rules) { return Array.isArray(rules) ? rules.filter((r) => r && typeof r.value === 'string' && r.value.length <= 512).map((r) => ({ id: r.id || crypto.randomUUID(), value: r.value, mode: r.mode === 'substring-ci' ? 'substring-ci' : 'exact', enabled: r.enabled !== false })) : []; }
 function integerBetween(value, min, max, fallback) { const n = Number(value); return Number.isInteger(n) ? Math.min(max, Math.max(min, n)) : fallback; }
 

@@ -78,7 +78,7 @@ async function adminApi(req, res, url) {
   if (req.method === 'GET' && url.pathname === '/admin/api/logs') return sendJson(res, 200, recentLogs.slice(-100));
   if (req.method === 'PUT' && url.pathname === '/admin/api/settings') { const body = await readJson(req, 32 * 1024); if (body.upstreamUrl !== undefined) validateUpstream(body.upstreamUrl); await store.update((next) => { if (body.upstreamUrl !== undefined) next.upstreamUrl = body.upstreamUrl; return next; }); return sendJson(res, 200, publicState(store.snapshot())); }
   if (req.method === 'PUT' && url.pathname === '/admin/api/retry') { const body = await readJson(req, 128 * 1024); await store.update((next) => { next.retry = body; return next; }); return sendJson(res, 200, publicState(store.snapshot())); }
-  const retryMatch = url.pathname.match(/^\/admin\/api\/retry-rules\/(code|message)(?:\/([^/]+))?$/);
+  const retryMatch = url.pathname.match(/^\/admin\/api\/retry-rules\/(status|code|message)(?:\/([^/]+))?$/);
   if (retryMatch) return retryRuleApi(req, res, retryMatch[1], retryMatch[2] ? decodeURIComponent(retryMatch[2]) : null);
   if (req.method === 'POST' && url.pathname === '/admin/api/prompts') { const body = await readJson(req, 128 * 1024); if (!body?.modelId || typeof body.prompt !== 'string') return sendJson(res, 400, { error: { message: 'modelId and prompt are required' } }); const now = new Date().toISOString(); await store.update((next) => { if (next.promptRules.some((rule) => rule.modelId === body.modelId)) throw Object.assign(new Error('A rule for this model already exists'), { statusCode: 409 }); next.promptRules.push({ id: crypto.randomUUID(), modelId: body.modelId, prompt: body.prompt, enabled: body.enabled !== false, createdAt: now, updatedAt: now, hits: 0 }); return next; }); return sendJson(res, 201, publicState(store.snapshot())); }
   const match = url.pathname.match(/^\/admin\/api\/prompts\/([^/]+)$/);
@@ -92,16 +92,31 @@ function validateUpstream(value) {
   if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) throw Object.assign(new Error('upstreamUrl must use HTTP(S) without embedded credentials'), { statusCode: 400 });
 }
 async function retryRuleApi(req, res, kind, id) {
-  const key = kind === 'code' ? 'codeRules' : 'messageRules';
+  const key = kind === 'status' ? 'statusRules' : kind === 'code' ? 'codeRules' : 'messageRules';
   if (req.method === 'POST') {
     const body = await readJson(req, 16 * 1024);
-    if (typeof body.value !== 'string' || !body.value.trim()) return sendJson(res, 400, { error: { message: 'value is required' } });
-    await store.update((next) => { next.retry[key].push({ id: crypto.randomUUID(), value: body.value.trim(), mode: body.mode === 'substring-ci' ? 'substring-ci' : 'exact', enabled: body.enabled !== false }); return next; });
+    if (kind === 'status') {
+      const status = Number(body.status ?? body.value);
+      if (!Number.isInteger(status) || status < 400 || status > 599) return sendJson(res, 400, { error: { message: 'status must be an integer between 400 and 599' } });
+      await store.update((next) => { if (next.retry.statusRules.some((rule) => rule.status === status)) throw Object.assign(new Error('This status code already exists'), { statusCode: 409 }); next.retry.statusRules.push({ id: crypto.randomUUID(), status, enabled: body.enabled !== false }); return next; });
+    } else {
+      if (typeof body.value !== 'string' || !body.value.trim()) return sendJson(res, 400, { error: { message: 'value is required' } });
+      await store.update((next) => { next.retry[key].push({ id: crypto.randomUUID(), value: body.value.trim(), mode: body.mode === 'substring-ci' ? 'substring-ci' : 'exact', enabled: body.enabled !== false }); return next; });
+    }
     return sendJson(res, 201, publicState(store.snapshot()));
   }
   if (!id) return sendJson(res, 400, { error: { message: 'rule id is required' } });
   if (req.method === 'DELETE') { await store.update((next) => { next.retry[key] = next.retry[key].filter((rule) => rule.id !== id); return next; }); return sendJson(res, 200, publicState(store.snapshot())); }
-  if (req.method === 'PUT') { const body = await readJson(req, 16 * 1024); await store.update((next) => { const rule = next.retry[key].find((item) => item.id === id); if (!rule) throw Object.assign(new Error('Rule not found'), { statusCode: 404 }); if (body.value !== undefined) rule.value = String(body.value).trim(); if (body.mode !== undefined) rule.mode = body.mode === 'substring-ci' ? 'substring-ci' : 'exact'; if (body.enabled !== undefined) rule.enabled = Boolean(body.enabled); return next; }); return sendJson(res, 200, publicState(store.snapshot())); }
+  if (req.method === 'PUT') {
+    const body = await readJson(req, 16 * 1024);
+    await store.update((next) => {
+      const rule = next.retry[key].find((item) => item.id === id); if (!rule) throw Object.assign(new Error('Rule not found'), { statusCode: 404 });
+      if (kind === 'status') { const status = Number(body.status ?? body.value ?? rule.status); if (!Number.isInteger(status) || status < 400 || status > 599) throw Object.assign(new Error('status must be an integer between 400 and 599'), { statusCode: 400 }); if (next.retry.statusRules.some((item) => item.id !== id && item.status === status)) throw Object.assign(new Error('This status code already exists'), { statusCode: 409 }); rule.status = status; }
+      else { if (body.value !== undefined) rule.value = String(body.value).trim(); if (body.mode !== undefined) rule.mode = body.mode === 'substring-ci' ? 'substring-ci' : 'exact'; }
+      if (body.enabled !== undefined) rule.enabled = Boolean(body.enabled); return next;
+    });
+    return sendJson(res, 200, publicState(store.snapshot()));
+  }
   return sendJson(res, 405, { error: { message: 'Method not allowed' } });
 }
 

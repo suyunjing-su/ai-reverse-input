@@ -30,12 +30,12 @@ npm start
 管理员可配置：
 
 - 模型提示词规则：模型 ID 精确匹配、独立正文/启停/统计。
-- Responses 重试：全局开关、code/message 规则（精确或大小写不敏感子串）、最大重试次数、退避、总时限和 SSE 前置缓存上限。
+- Responses 重试：全局开关、HTTP 状态码精确规则（适用于 Chat Completions、Responses、Anthropic Messages 三个 POST 接口）、JSON `error.code` 精确规则、`message` 精确或大小写不敏感子串规则、最大重试次数、退避、总时限和 SSE 前置缓存上限。任一启用的状态码、code 或 message 规则命中即满足重试条件。
 - 系统设置：上游地址、监听设置展示和运行限制展示。
 
 ## 重试边界
 
-默认关闭重试。仅 `POST` 且规范化路径为 `/v1/responses` 的创建请求参与该模块；Chat Completions、Anthropic Messages、Responses 其他路径和网络异常不会隐式重试。非流式响应会在交付前检查明确的错误对象。流式请求仅在尚未交付实质输出的有界前置事件阶段重试；一旦透传开始，后续失败按上游原始 SSE 语义交付，不会伪装成无缝重试。重试请求复用已经完成的提示词改写体，因此不会重复注入。
+默认关闭重试。状态码重试仅适用于三个 `POST` 创建接口：`/v1/chat/completions`、`/v1/responses` 和 `/v1/messages`；其他路径和网络异常不会隐式重试。JSON `error.code`/`message` 错误匹配仍仅适用于 Responses API。非流式响应会在交付前检查 HTTP 状态码规则和明确的 JSON 错误对象。流式请求会先检查匹配的 HTTP 状态码；Responses 还会在尚未交付实质输出的有界前置事件阶段检查 SSE 错误；一旦透传开始，后续失败按上游原始 SSE 语义交付，不会伪装成无缝重试。Chat Completions 和 Anthropic Messages 的正常流式响应不经过不必要的 SSE 前置缓存。重试请求复用已经完成的提示词改写体，因此不会重复注入。
 
 ## 生产部署
 

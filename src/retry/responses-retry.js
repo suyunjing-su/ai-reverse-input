@@ -6,6 +6,12 @@ export function extractResponsesError(payload) {
   for (const error of candidates) if (error && typeof error === 'object' && (typeof error.code === 'string' || typeof error.message === 'string')) return { code: error.code || '', message: error.message || '' };
   return null;
 }
+export function matchesStatus(statusCode, config) {
+  const status = Number(statusCode);
+  if (!Number.isInteger(status) || status < 400 || status > 599) return null;
+  const rule = (config.statusRules || []).find((item) => item.enabled && item.status === status);
+  return rule ? { kind: 'status', rule } : null;
+}
 export function matchesRetry(error, config) {
   if (!error) return null;
   for (const rule of [...(config.codeRules || [])]) if (rule.enabled && matchesRule(error.code, rule)) return { kind: 'code', rule };
@@ -32,14 +38,27 @@ export async function executeResponseRequest({ request, config, upstream, client
     try {
       const response = await upstream(attempt.signal); const stream = Boolean(request.stream);
       if (!stream) {
-        const result = await readResponse(response, maxResponseBodyBytes, attempt.signal); const error = parseResponseError(response.statusCode, result.body); const match = matchesRetry(error, config); const delay = match ? backoffDelay(config, retryCount + 1) : 0;
+        const result = await readResponse(response, maxResponseBodyBytes, attempt.signal); const error = parseResponseError(response.statusCode, result.body); const match = matchesStatus(response.statusCode, config) || (request.inspectStreamErrors !== false ? matchesRetry(error, config) : null); const delay = match ? backoffDelay(config, retryCount + 1) : 0;
         if (match && retryCount < config.maxRetries && withinDeadline(started, config.totalTimeoutMs) && delay < (config.totalTimeoutMs - (Date.now() - started))) { retryCount++; onRetry(match, retryCount); await retryDelay(delay, clientSignal); continue; }
         if (match && (retryCount >= config.maxRetries || !withinDeadline(started, config.totalTimeoutMs))) onExhausted(); else if (retryCount) onSuccess();
         return { response, body: result.body, retryCount };
       }
-      const outcome = await handleStreamAttempt(response, config, attempt.signal, started, retryCount);
+      if (request.inspectStreamErrors === false) {
+        const statusMatch = matchesStatus(response.statusCode, config);
+        if (statusMatch && retryCount < config.maxRetries && withinDeadline(started, config.totalTimeoutMs) && backoffDelay(config, retryCount + 1) < (config.totalTimeoutMs - (Date.now() - started))) {
+          response.destroy(); retryCount++; onRetry(statusMatch, retryCount); await retryDelay(backoffDelay(config, retryCount), clientSignal); continue;
+        }
+        if (statusMatch && retryCount >= config.maxRetries) onExhausted(); else if (retryCount) onSuccess();
+        await sendStream(response, [], null, attempt.signal, response[Symbol.asyncIterator]());
+        return { retryCount };
+      }
+      const statusMatch = matchesStatus(response.statusCode, config);
+      if (statusMatch && retryCount < config.maxRetries && withinDeadline(started, config.totalTimeoutMs) && backoffDelay(config, retryCount + 1) < (config.totalTimeoutMs - (Date.now() - started))) {
+        response.destroy(); retryCount++; onRetry(statusMatch, retryCount); await retryDelay(backoffDelay(config, retryCount), clientSignal); continue;
+      }
+      const outcome = await handleStreamAttempt(response, config, attempt.signal, started, retryCount, statusMatch, request.inspectStreamErrors !== false);
       if (outcome.retry) { retryCount++; onRetry(outcome.match, retryCount); await retryDelay(backoffDelay(config, retryCount), clientSignal); continue; }
-      if (retryCount) { if (outcome.match && retryCount >= config.maxRetries) onExhausted(); else onSuccess(); }
+      if ((outcome.match || statusMatch) && retryCount >= config.maxRetries) onExhausted(); else if (retryCount) onSuccess();
       await sendStream(outcome.response, outcome.prefix, outcome.rest, attempt.signal, outcome.iterator);
       return { retryCount };
     } finally { attempt.dispose(); }
@@ -55,8 +74,8 @@ async function readResponse(response, maxBytes, signal) { const chunks = []; let
 function parseResponseError(statusCode, body) { try { const json = JSON.parse(body.toString('utf8')); return extractResponsesError(json); } catch { return null; } }
 function withinDeadline(started, timeout) { return Date.now() - started < timeout; }
 
-async function handleStreamAttempt(response, config, signal, started, retryCount) {
-  const parser = new SseParser(); const prefix = []; let prefixBytes = 0; let passthrough = false; let matched = null;
+async function handleStreamAttempt(response, config, signal, started, retryCount, initialMatch = null, allowErrorRules = true) {
+  const parser = new SseParser(); const prefix = []; let prefixBytes = 0; let passthrough = false; let matched = initialMatch;
   const iterator = response[Symbol.asyncIterator]();
   const abortResponse = () => response.destroy?.(Object.assign(new Error('Upstream request aborted'), { name: 'AbortError' }));
   signal.addEventListener('abort', abortResponse, { once: true });
@@ -75,7 +94,7 @@ async function handleStreamAttempt(response, config, signal, started, retryCount
       const events = parser.feed(chunk);
       for (const event of events) {
         prefix.push(event.raw); prefixBytes += event.raw.length;
-        const error = eventError(event); const candidate = matchesRetry(error, config);
+        const error = eventError(event); const candidate = allowErrorRules ? matchesRetry(error, config) : null;
         if (candidate && !isSubstantive(event) && retryCount < config.maxRetries && withinDeadline(started, config.totalTimeoutMs) && backoffDelay(config, retryCount + 1) < (config.totalTimeoutMs - (Date.now() - started))) { response.destroy(); return { retry: true, match: candidate }; }
         if (error && candidate) matched = candidate;
         if (isSubstantive(event) || isTerminal(event) || prefixBytes >= config.preflightBytes) passthrough = true;
@@ -85,7 +104,7 @@ async function handleStreamAttempt(response, config, signal, started, retryCount
     if (!passthrough) {
       for (const event of parser.finish()) {
         prefix.push(event.raw); prefixBytes += event.raw.length;
-        const error = eventError(event); const candidate = matchesRetry(error, config);
+        const error = eventError(event); const candidate = allowErrorRules ? matchesRetry(error, config) : null;
         if (candidate && retryCount < config.maxRetries && !isSubstantive(event) && withinDeadline(started, config.totalTimeoutMs) && backoffDelay(config, retryCount + 1) < (config.totalTimeoutMs - (Date.now() - started))) return { retry: true, match: candidate };
         if (error && candidate) matched = candidate;
       }

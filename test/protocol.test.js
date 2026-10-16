@@ -2,8 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { detectProtocol, injectPrompt } from '../src/protocols/prompt-injection.js';
 import { SseParser } from '../src/retry/sse-parser.js';
+import { isStatusRetryEndpoint } from '../src/http-utils.js';
 import { extractResponsesError, matchesRetry } from '../src/retry/responses-retry.js';
 
+test('status retries are eligible only for the three supported POST interfaces', () => {
+  assert.equal(isStatusRetryEndpoint({ method: 'POST', url: '/v1/chat/completions' }), true);
+  assert.equal(isStatusRetryEndpoint({ method: 'POST', url: '/v1/responses' }), true);
+  assert.equal(isStatusRetryEndpoint({ method: 'POST', url: '/v1/messages' }), true);
+  assert.equal(isStatusRetryEndpoint({ method: 'POST', url: '/internal/v1/messages' }), true);
+  assert.equal(isStatusRetryEndpoint({ method: 'GET', url: '/v1/messages' }), false);
+  assert.equal(isStatusRetryEndpoint({ method: 'POST', url: '/v1/responses/resp_123' }), false);
+});
 test('injects exact model prompt once in chat user text and preserves system/tools', () => {
   const original = { model: 'alpha', system: 'keep', tools: [{ type: 'x' }], messages: [{ role: 'system', content: 'sys' }, { role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }, { type: 'text', text: 'hello' }] }] };
   const result = injectPrompt(Buffer.from(JSON.stringify(original)), 'chat', { prompt: 'RULE' });

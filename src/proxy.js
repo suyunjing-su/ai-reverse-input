@@ -2,7 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { Readable } from 'node:stream';
 import { detectProtocol, findPromptRule, injectPrompt } from './protocols/prompt-injection.js';
-import { copyForwardHeaders, isJsonContentType, isResponsesCreate, normalizePath, readRequestBody, safeError, waitForAbort, pipeWithAbort, sendJson } from './http-utils.js';
+import { copyForwardHeaders, isJsonContentType, isResponsesCreate, isStatusRetryEndpoint, normalizePath, readRequestBody, safeError, waitForAbort, pipeWithAbort, sendJson } from './http-utils.js';
 import { executeResponseRequest, responseHeaders } from './retry/responses-retry.js';
 
 export async function handleProxy(req, res, { store, logger, limits }) {
@@ -17,8 +17,8 @@ export async function handleProxy(req, res, { store, logger, limits }) {
     }
     await store.incrementMetric('requests');
     const target = buildTarget(config.upstreamUrl, req.url); const headers = copyForwardHeaders(req.headers); if (forwardedBody.length) headers['content-length'] = String(forwardedBody.length); else delete headers['content-length'];
-    const requestInfo = { stream: parsed?.stream === true, body: forwardedBody, method: req.method, headers, target };
-    const canRetry = isResponsesCreate(req) && config.retry.enabled;
+    const requestInfo = { stream: parsed?.stream === true, inspectStreamErrors: isResponsesCreate(req), body: forwardedBody, method: req.method, headers, target };
+    const canRetry = config.retry.enabled && (isResponsesCreate(req) || (isStatusRetryEndpoint(req) && config.retry.statusRules?.some((rule) => rule.enabled)));
     const upstream = (signal = controller.signal) => requestUpstream({ ...requestInfo, signal, timeoutMs: canRetry ? config.retry.totalTimeoutMs : limits.requestTimeoutMs });
     if (canRetry && requestInfo.stream) {
       await executeResponseRequest({ request: requestInfo, config: config.retry, upstream, clientSignal: controller.signal, maxResponseBodyBytes: limits.maxResponseBodyBytes, onRetry: (match, count) => { logger.info('responses retry', { path: '/v1/responses', attempt: count + 1, match: match.kind }); void store.incrementMetric('retries'); }, onSuccess: () => void store.incrementMetric('retrySuccesses'), onExhausted: () => void store.incrementMetric('retryExhausted'), sendStream: (response, prefix, rest, signal, iterator) => sendStreamResponse(res, response, prefix, rest, signal, iterator) });
