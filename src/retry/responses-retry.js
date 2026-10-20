@@ -81,14 +81,15 @@ async function handleStreamAttempt(response, config, signal, started, retryCount
   signal.addEventListener('abort', abortResponse, { once: true });
   let timeoutHandle;
   const timeoutPromise = new Promise((resolve) => { timeoutHandle = setTimeout(() => resolve({ timedOut: true }), Math.min(config.preflightMs, Math.max(1, config.totalTimeoutMs - (Date.now() - started)))); });
-  let pendingNext = iterator.next().then((value) => ({ value }));
+  let pendingNext = nextIteratorValue(iterator);
   try {
     while (true) {
       const result = await Promise.race([pendingNext, timeoutPromise]);
       if (result.timedOut) return { retry: false, response, prefix, rest: parser.takePending(), iterator: handoffIterator(pendingNext, iterator), match: matched };
+      if (result.error) throw result.error;
       const next = result.value;
       if (next.done) break;
-      pendingNext = iterator.next().then((value) => ({ value }));
+      pendingNext = nextIteratorValue(iterator);
       const chunk = Buffer.from(next.value);
       if (passthrough) return { retry: false, response, prefix, rest: Buffer.concat([parser.takePending(), chunk]), iterator, match: matched };
       const events = parser.feed(chunk);
@@ -113,9 +114,12 @@ async function handleStreamAttempt(response, config, signal, started, retryCount
   return { retry: false, response, prefix, rest: Buffer.alloc(0), iterator, match: matched };
 }
 
+function nextIteratorValue(iterator) {
+  return Promise.resolve().then(() => iterator.next()).then((value) => ({ value }), (error) => ({ error }));
+}
 function handoffIterator(first, iterator) {
   let pending = first;
-  return { async next() { const result = await pending; pending = iterator.next().then((value) => ({ value })); return result.value; }, async return() { if (iterator.return) return iterator.return(); return { done: true }; }, [Symbol.asyncIterator]() { return this; } };
+  return { async next() { const result = await pending; if (result.error) throw result.error; pending = nextIteratorValue(iterator); return result.value; }, async return() { if (iterator.return) return iterator.return(); return { done: true }; }, [Symbol.asyncIterator]() { return this; } };
 }
 
 export function responseHeaders(response) { const headers = {}; for (const [key, value] of Object.entries(response.headers)) if (!['connection', 'keep-alive', 'transfer-encoding', 'content-length', 'upgrade'].includes(key.toLowerCase())) headers[key] = value; return headers; }

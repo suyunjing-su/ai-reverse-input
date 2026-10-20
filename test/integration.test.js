@@ -46,3 +46,24 @@ test('SSE preflight deadline commits without waiting for the next event', async 
   await executeResponseRequest({ request: { stream: true }, config, clientSignal: new AbortController().signal, upstream: async () => ({ statusCode: 200, headers: { 'content-type': 'text/event-stream' }, ...stream, [Symbol.asyncIterator]: () => stream[Symbol.asyncIterator](), destroy() {} }), sendStream: async (_response, prefix, rest, _signal, iterator) => { for (const chunk of prefix) delivered.push(chunk); if (rest?.length) delivered.push(rest); for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) delivered.push(chunk); } });
   assert.match(Buffer.concat(delivered).toString(), /response\.created/);
 });
+
+test('discarded SSE retry attempts consume premature-close iterator errors', async () => {
+  let attempts = 0; const delivered = [];
+  const response = () => {
+    attempts++;
+    if (attempts > 1) return responseFromChunks(200, ['event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n', 'event: response.completed\ndata: {"type":"response.completed"}\n\n']);
+    let rejectPending;
+    let first = true;
+    const iterator = {
+      next() {
+        if (first) { first = false; return Promise.resolve({ done: false, value: Buffer.from('event: error\ndata: {"error":{"code":"busy"}}\n\n') }); }
+        return new Promise((resolve, reject) => { rejectPending = reject; });
+      },
+      async return() { return { done: true }; },
+      [Symbol.asyncIterator]() { return this; }
+    };
+    return { statusCode: 200, headers: { 'content-type': 'text/event-stream' }, [Symbol.asyncIterator]: () => iterator, destroy() { rejectPending?.(Object.assign(new Error('Premature close'), { code: 'ERR_STREAM_PREMATURE_CLOSE' })); } };
+  };
+  await executeResponseRequest({ request: { stream: true }, config: retryConfig, clientSignal: new AbortController().signal, upstream: async () => response(), sendStream: async (_response, prefix, rest, _signal, iterator) => { for (const chunk of prefix) delivered.push(chunk.toString()); if (rest?.length) delivered.push(rest.toString()); for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) delivered.push(chunk.toString()); } });
+  assert.equal(attempts, 2); assert.match(delivered.join(''), /"delta":"ok"/);
+});
