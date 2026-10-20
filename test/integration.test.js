@@ -67,3 +67,26 @@ test('discarded SSE retry attempts consume premature-close iterator errors', asy
   await executeResponseRequest({ request: { stream: true }, config: retryConfig, clientSignal: new AbortController().signal, upstream: async () => response(), sendStream: async (_response, prefix, rest, _signal, iterator) => { for (const chunk of prefix) delivered.push(chunk.toString()); if (rest?.length) delivered.push(rest.toString()); for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) delivered.push(chunk.toString()); } });
   assert.equal(attempts, 2); assert.match(delivered.join(''), /"delta":"ok"/);
 });
+
+test('Responses never retries after tool-call output appears in the same SSE chunk', async () => {
+  let attempts = 0; const delivered = [];
+  await executeResponseRequest({ request: { stream: true }, config: retryConfig, clientSignal: new AbortController().signal, upstream: async () => {
+    attempts++;
+    return responseFromChunks(200, ['event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1"}}\n\nevent: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","delta":"{\\"command\\": \\"node .n\\"}"}\n\nevent: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"busy"}}}\n\n']);
+  }, sendStream: async (_response, prefix, rest, _signal, iterator) => { for (const chunk of prefix) delivered.push(chunk.toString()); if (rest?.length) delivered.push(rest.toString()); for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) delivered.push(chunk.toString()); } });
+  assert.equal(attempts, 1); assert.match(delivered.join(''), /response\.function_call_arguments\.delta/); assert.match(delivered.join(''), /response\.failed/);
+});
+
+
+test('Responses keeps a streamed tool-call attempt when a later chunk reports an error', async () => {
+  let attempts = 0; const delivered = [];
+  await executeResponseRequest({ request: { stream: true }, config: retryConfig, clientSignal: new AbortController().signal, upstream: async () => {
+    attempts++;
+    return responseFromChunks(200, [
+      'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_1"}}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","delta":"{\\"command\\": \\"node .n\\"}"}\n\n',
+      'event: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"busy"}}}\n\n'
+    ]);
+  }, sendStream: async (_response, prefix, rest, _signal, iterator) => { for (const chunk of prefix) delivered.push(chunk.toString()); if (rest?.length) delivered.push(rest.toString()); for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) delivered.push(chunk.toString()); } });
+  assert.equal(attempts, 1); assert.match(delivered.join(''), /"call_id":"call_1"/); assert.match(delivered.join(''), /"delta"/); assert.match(delivered.join(''), /response\.failed/);
+});

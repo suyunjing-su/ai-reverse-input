@@ -21,7 +21,10 @@ export function matchesRetry(error, config) {
 function matchesRule(value, rule) { if (typeof value !== 'string') return false; return rule.mode === 'substring-ci' ? value.toLocaleLowerCase().includes(rule.value.toLocaleLowerCase()) : value === rule.value; }
 export function eventError(event) { const error = extractResponsesError(event.json); if (error) return error; if (event.type === 'error' && event.json && typeof event.json === 'object') return extractResponsesError({ error: event.json.error || event.json }); return null; }
 export function isTerminal(event) { return ['response.completed', 'response.incomplete', 'response.failed', 'error'].includes(event.type) || event.data === '[DONE]'; }
-export function isSubstantive(event) { return /(?:\.delta|output_text|content_part\.added|function_call_arguments)/.test(event.type) && !/created|in_progress/.test(event.type); }
+export function isSubstantive(event) {
+  if (!event?.type || !event.type.startsWith('response.')) return false;
+  return !['response.created', 'response.queued', 'response.in_progress', 'response.completed', 'response.incomplete', 'response.failed'].includes(event.type);
+}
 export function backoffDelay(config, retryIndex) { const raw = config.exponentialBackoff ? config.baseDelayMs * (2 ** Math.max(0, retryIndex - 1)) : config.baseDelayMs; return Math.min(config.maxDelayMs, raw); }
 export async function retryDelay(ms, signal) {
   if (ms <= 0) return;
@@ -91,23 +94,24 @@ async function handleStreamAttempt(response, config, signal, started, retryCount
       if (next.done) break;
       pendingNext = nextIteratorValue(iterator);
       const chunk = Buffer.from(next.value);
-      if (passthrough) return { retry: false, response, prefix, rest: Buffer.concat([parser.takePending(), chunk]), iterator, match: matched };
+      if (passthrough) return { retry: false, response, prefix, rest: Buffer.concat([parser.takePending(), chunk]), iterator: handoffIterator(pendingNext, iterator), match: matched };
       const events = parser.feed(chunk);
       for (const event of events) {
         prefix.push(event.raw); prefixBytes += event.raw.length;
         const error = eventError(event); const candidate = allowErrorRules ? matchesRetry(error, config) : null;
-        if (candidate && !isSubstantive(event) && retryCount < config.maxRetries && withinDeadline(started, config.totalTimeoutMs) && backoffDelay(config, retryCount + 1) < (config.totalTimeoutMs - (Date.now() - started))) { response.destroy(); return { retry: true, match: candidate }; }
+        if (candidate && !passthrough && !isSubstantive(event) && retryCount < config.maxRetries && withinDeadline(started, config.totalTimeoutMs) && backoffDelay(config, retryCount + 1) < (config.totalTimeoutMs - (Date.now() - started))) { response.destroy(); return { retry: true, match: candidate }; }
         if (error && candidate) matched = candidate;
         if (isSubstantive(event) || isTerminal(event) || prefixBytes >= config.preflightBytes) passthrough = true;
       }
-      if (passthrough || prefixBytes >= config.preflightBytes) return { retry: false, response, prefix, rest: parser.takePending(), iterator, match: matched };
+      if (passthrough || prefixBytes >= config.preflightBytes) return { retry: false, response, prefix, rest: parser.takePending(), iterator: handoffIterator(pendingNext, iterator), match: matched };
     }
     if (!passthrough) {
       for (const event of parser.finish()) {
         prefix.push(event.raw); prefixBytes += event.raw.length;
         const error = eventError(event); const candidate = allowErrorRules ? matchesRetry(error, config) : null;
-        if (candidate && retryCount < config.maxRetries && !isSubstantive(event) && withinDeadline(started, config.totalTimeoutMs) && backoffDelay(config, retryCount + 1) < (config.totalTimeoutMs - (Date.now() - started))) return { retry: true, match: candidate };
+        if (candidate && !passthrough && !isSubstantive(event) && retryCount < config.maxRetries && withinDeadline(started, config.totalTimeoutMs) && backoffDelay(config, retryCount + 1) < (config.totalTimeoutMs - (Date.now() - started))) return { retry: true, match: candidate };
         if (error && candidate) matched = candidate;
+        if (isSubstantive(event) || isTerminal(event)) passthrough = true;
       }
     }
   } finally { clearTimeout(timeoutHandle); signal.removeEventListener('abort', abortResponse); }
