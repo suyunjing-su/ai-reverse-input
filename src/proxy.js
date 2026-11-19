@@ -1,8 +1,9 @@
 import http from 'node:http';
 import https from 'node:https';
-import { once } from 'node:events';
+import { pipeline } from 'node:stream';
+import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
 import { detectProtocol, findPromptRule, injectPrompt } from './protocols/prompt-injection.js';
-import { copyForwardHeaders, isJsonContentType, isResponsesCreate, isStatusRetryEndpoint, readRequestBody, safeError, waitForAbort, pipeWithAbort, sendJson } from './http-utils.js';
+import { copyForwardHeaders, isEventStream, isIdentityEncoding, isJsonContentType, isResponsesCreate, isStatusRetryEndpoint, readRequestBody, safeError, waitForAbort, pipeWithAbort, sendJson } from './http-utils.js';
 import { executeResponseRequest } from './retry/responses-retry.js';
 import { ResponsesSseCompatibility } from './protocols/responses-sse-compat.js';
 
@@ -31,20 +32,19 @@ export async function handleProxy(req, res, { store, logger, limits, debugCaptur
     const target = buildTarget(config.upstreamUrl, req.url); const headers = copyForwardHeaders(req.headers); if (forwardedBody.length) headers['content-length'] = String(forwardedBody.length); else delete headers['content-length'];
     const responses = isResponsesCreate(req);
     const requestInfo = { stream: parsed?.stream === true, inspectStreamErrors: responses, body: forwardedBody, method: req.method, headers, target };
-    const sendStream = (response, prefix, rest, signal, iterator) => sendStreamResponse(res, response, prefix, rest, signal, iterator, onHeaders, onBody, responses && requestInfo.stream ? parsed?.model : null);
+    const model = responses && typeof parsed?.model === 'string' && parsed.model.trim() ? parsed.model : null;
+    const sendStream = (response, prefix, rest, signal, iterator) => sendStreamResponse(res, response, prefix, rest, signal, iterator, onHeaders, onBody, model);
     const canRetry = config.retry.enabled && (responses || (isStatusRetryEndpoint(req) && config.retry.statusRules?.some((rule) => rule.enabled)));
-    const upstream = (signal = controller.signal) => {
+    const upstream = async (signal = controller.signal) => {
       if (debugId && !signal.aborted) debugCapture.forward(debugId, requestInfo.body, requestInfo.headers);
-      return requestUpstream({ ...requestInfo, signal, timeoutMs: canRetry ? config.retry.totalTimeoutMs : limits.requestTimeoutMs });
+      const response = await requestUpstream({ ...requestInfo, signal, timeoutMs: canRetry ? config.retry.totalTimeoutMs : limits.requestTimeoutMs });
+      return model && isRepairableSse(response) ? decodeSse(response) : response;
     };
-    if (canRetry && requestInfo.stream) {
-      await executeResponseRequest({ request: requestInfo, config: config.retry, upstream, clientSignal: controller.signal, maxResponseBodyBytes: limits.maxResponseBodyBytes, onRetry: (match, count) => { logger.info('responses retry', { path: '/v1/responses', attempt: count + 1, match: match.kind }); void store.incrementMetric('retries'); }, onSuccess: () => void store.incrementMetric('retrySuccesses'), onExhausted: () => void store.incrementMetric('retryExhausted'), sendStream });
-      logger.info('proxy request', { method: req.method, path: pathname, status: res.statusCode || 200, attempts: 'retry-managed', promptHit, durationMs: Date.now() - started });
+    if (canRetry) {
+      const outcome = await executeResponseRequest({ request: requestInfo, config: config.retry, upstream, clientSignal: controller.signal, maxResponseBodyBytes: limits.maxResponseBodyBytes, onRetry: (match, count) => { logger.info('responses retry', { path: pathname, attempt: count + 1, match: match.kind }); void store.incrementMetric('retries'); }, onSuccess: () => void store.incrementMetric('retrySuccesses'), onExhausted: () => void store.incrementMetric('retryExhausted'), sendStream });
+      if (outcome.response) { writeResponseHeaders(res, outcome.response, onHeaders); onBody?.(outcome.body); res.end(outcome.body); }
+      logger.info('proxy request', { method: req.method, path: pathname, status: res.statusCode, attempts: outcome.retryCount + 1, promptHit, durationMs: Date.now() - started });
       return;
-    }
-    if (canRetry && !requestInfo.stream) {
-      const outcome = await executeResponseRequest({ request: requestInfo, config: config.retry, upstream, clientSignal: controller.signal, maxResponseBodyBytes: limits.maxResponseBodyBytes, onRetry: (match, count) => { logger.info('responses retry', { path: '/v1/responses', attempt: count + 1, match: match.kind }); void store.incrementMetric('retries'); }, onSuccess: () => void store.incrementMetric('retrySuccesses'), onExhausted: () => void store.incrementMetric('retryExhausted'), sendStream: async () => {} });
-      writeResponseHeaders(res, outcome.response, onHeaders); onBody?.(outcome.body); res.end(outcome.body); logger.info('proxy request', { method: req.method, path: pathname, status: outcome.response.statusCode, attempts: outcome.retryCount + 1, promptHit, durationMs: Date.now() - started }); return;
     }
     const response = await upstream(); await sendStream(response, [], null, controller.signal);
     logger.info('proxy request', { method: req.method, path: pathname, status: response.statusCode, attempts: 1, promptHit, durationMs: Date.now() - started });
@@ -74,20 +74,48 @@ function writeResponseHeaders(res, response, onHeaders, rewritten = false) {
   res.writeHead(status, headers); onHeaders?.(status, headers);
 }
 
+function isRepairableSse({ statusCode, headers }) {
+  return statusCode >= 200 && statusCode < 300 && statusCode !== 204 && statusCode !== 205 && statusCode !== 206 && !headers['content-range'] && isEventStream(headers);
+}
+
+function decodeSse(response) {
+  const encoding = String(response.headers['content-encoding'] || '').trim().toLowerCase();
+  const createDecoder = encoding === 'gzip' || encoding === 'x-gzip' ? createGunzip : encoding === 'br' ? createBrotliDecompress : encoding === 'deflate' ? createInflate : null;
+  if (!createDecoder) return response;
+  const decoded = createDecoder();
+  const headers = { ...response.headers };
+  delete headers['content-encoding']; delete headers['content-length']; delete headers.etag;
+  response.pipe(decoded);
+  decoded.statusCode = response.statusCode; decoded.headers = headers;
+  return decoded;
+}
+
+async function* responseChunks(prefix, rest, iterator) {
+  yield* prefix;
+  if (rest?.length) yield rest;
+  yield* { [Symbol.asyncIterator]: () => iterator };
+}
+
 async function sendStreamResponse(res, response, prefix, rest, signal, iterator, onHeaders, onBody, model) {
-  const { statusCode, headers } = response;
-  const encoding = String(headers['content-encoding'] ?? 'identity').trim().toLowerCase();
-  const transform = typeof model === 'string' && model.trim() && statusCode >= 200 && statusCode < 300 && statusCode !== 206 && !headers['content-range'] &&
-    (!encoding || encoding === 'identity') && /^text\/event-stream(?:\s*;|\s*$)/i.test(String(headers['content-type'] || ''))
-    ? new ResponsesSseCompatibility(model) : null;
+  signal.throwIfAborted();
+  const transform = model && isRepairableSse(response) && isIdentityEncoding(response.headers) ? new ResponsesSseCompatibility(model) : null;
   writeResponseHeaders(res, response, onHeaders, Boolean(transform));
-  for (const chunk of rest?.length ? [...prefix, rest] : prefix) {
-    signal.throwIfAborted();
+  const write = async (chunk) => {
     const output = transform ? transform.transform(chunk) : chunk;
-    if (!output.length) continue;
+    if (!output.length) return;
     onBody?.(output);
-    if (!res.write(output)) await once(res, 'drain', { signal });
-  }
+    if (!res.write(output)) await waitDrain(res, signal);
+  };
+  for (const chunk of prefix) await write(chunk);
+  if (rest?.length) await write(rest);
   const iterable = iterator ? { [Symbol.asyncIterator]: () => iterator, destroy: () => response.destroy() } : response;
   await pipeWithAbort(iterable, res, signal, onBody, transform);
+}
+
+function waitDrain(res, signal) {
+  return new Promise((resolve, reject) => {
+    const done = () => { signal.removeEventListener('abort', abort); resolve(); };
+    const abort = () => { res.removeListener('drain', done); reject(Object.assign(new Error('Request aborted'), { name: 'AbortError' })); };
+    res.once('drain', done); signal.addEventListener('abort', abort, { once: true });
+  });
 }

@@ -1,58 +1,99 @@
 const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
 const MODEL_EVENTS = new Set(['response.created', 'response.in_progress']);
+const utf8 = new TextDecoder('utf-8', { fatal: true });
 
 export class ResponsesSseCompatibility {
+  #parts = [];
+  #size = 0;
+  #lineHasData = false;
+  #pendingCR = false;
+  #blankCR = false;
+  #oversized = false;
+
   constructor(model, { maxFrameBytes = DEFAULT_MAX_FRAME_BYTES } = {}) {
     this.model = typeof model === 'string' && model.trim() ? model : null;
     this.maxFrameBytes = maxFrameBytes;
-    this.pending = Buffer.alloc(0);
   }
 
   transform(chunk) {
-    if (!this.model) return Buffer.from(chunk);
-    this.pending = Buffer.concat([this.pending, Buffer.from(chunk)]);
+    if (!this.model) return chunk;
     const output = [];
-    while (true) {
-      const boundary = findBoundary(this.pending);
-      if (boundary < 0) {
-        if (this.pending.length > this.maxFrameBytes) {
-          output.push(this.pending);
-          this.pending = Buffer.alloc(0);
-        }
-        break;
+    let start = 0;
+    const finish = (end) => {
+      this.#append(chunk.subarray(start, end), output);
+      if (!this.#oversized) output.push(repairFrame(Buffer.concat(this.#parts, this.#size), this.model));
+      this.#parts = [];
+      this.#size = 0;
+      this.#oversized = false;
+      start = end;
+    };
+    for (let i = 0; i < chunk.length; i++) {
+      const byte = chunk[i];
+      if (this.#pendingCR) {
+        this.#pendingCR = false;
+        if (this.#blankCR) finish(i + (byte === 10 ? 1 : 0));
+        if (byte === 10) continue;
       }
-      output.push(repairFrame(this.pending.subarray(0, boundary), this.model));
-      this.pending = this.pending.subarray(boundary);
+      if (byte === 13) {
+        this.#pendingCR = true;
+        this.#blankCR = !this.#lineHasData;
+        this.#lineHasData = false;
+      } else if (byte === 10) {
+        if (!this.#lineHasData) finish(i + 1);
+        this.#lineHasData = false;
+      } else {
+        this.#lineHasData = true;
+      }
     }
-    return Buffer.concat(output);
+    this.#append(chunk.subarray(start), output);
+    return output.length === 1 ? output[0] : Buffer.concat(output);
   }
 
   flush() {
-    const output = this.pending;
-    this.pending = Buffer.alloc(0);
-    return output;
+    const raw = Buffer.concat(this.#parts, this.#size);
+    this.#parts = [];
+    this.#size = 0;
+    return this.#pendingCR && this.#blankCR && !this.#oversized ? repairFrame(raw, this.model) : raw;
   }
-}
 
-function findBoundary(buffer) {
-  for (let i = 0; i < buffer.length - 1; i++) {
-    if (buffer[i] === 10 && buffer[i + 1] === 10) return i + 2;
-    if (buffer[i] === 13 && buffer[i + 1] === 10 && buffer[i + 2] === 13 && buffer[i + 3] === 10) return i + 4;
+  #append(part, output) {
+    if (!part.length) return;
+    if (this.#oversized || this.#size + part.length > this.maxFrameBytes) {
+      for (const prior of this.#parts) output.push(prior);
+      output.push(part);
+      this.#parts = [];
+      this.#size = 0;
+      this.#oversized = true;
+    } else {
+      this.#parts.push(Buffer.from(part));
+      this.#size += part.length;
+    }
   }
-  return -1;
 }
 
 function repairFrame(frame, model) {
-  const text = frame.toString('utf8');
-  const lines = [...text.matchAll(/([^\r\n]*)(\r\n|\r|\n)/g)];
-  const eventLine = lines.find(([, line]) => line.startsWith('event:'))?.[1] || '';
-  const dataLine = lines.find(([, line]) => line.startsWith('data:'));
-  if (!dataLine || (eventLine && !MODEL_EVENTS.has(eventLine.slice(6).trim()))) return frame;
+  // Latin-1 maps one character to one byte, so non-data fields stay byte-exact.
+  const wire = frame.toString('latin1');
+  const data = [];
+  for (const match of wire.matchAll(/([^\r\n]*)(\r\n|\r|\n)/g)) {
+    const line = match[1];
+    if (line === 'data' || line.startsWith('data:')) data.push({ match, value: line.slice(5).replace(/^ /, '') });
+  }
+  if (!data.length) return frame;
   let event;
-  try { event = JSON.parse(dataLine[1].slice(5).replace(/^ /, '')); } catch { return frame; }
-  if (!MODEL_EVENTS.has(event?.type) || !event.response || typeof event.response !== 'object' || event.response.model != null) return frame;
-  event.response.model = model;
-  const match = dataLine[0];
-  const replacement = `data: ${JSON.stringify(event)}${match[2]}`;
-  return Buffer.from(text.slice(0, match.index) + replacement + text.slice(match.index + match[0].length), 'utf8');
+  try { event = JSON.parse(utf8.decode(Buffer.from(data.map(({ value }) => value).join('\n'), 'latin1'))); } catch { return frame; }
+  const response = event?.response;
+  if (!MODEL_EVENTS.has(event?.type) || !response || typeof response !== 'object' || Array.isArray(response) || response.model != null) return frame;
+  response.model = model;
+  const output = [];
+  let offset = 0;
+  for (const [index, { match }] of data.entries()) {
+    output.push(frame.subarray(offset, match.index));
+    // Keep each terminator: deleting a data line can merge a bare CR and LF
+    // into one CRLF, removing the blank line that dispatches the event.
+    output.push(Buffer.from(`${index === 0 ? `data: ${JSON.stringify(event)}` : 'data:'}${match[2]}`));
+    offset = match.index + match[0].length;
+  }
+  output.push(frame.subarray(offset));
+  return Buffer.concat(output);
 }

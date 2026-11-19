@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 
 export class SseParser {
-  constructor() { this.pending = Buffer.alloc(0); this.eventLines = []; this.eventBytes = []; }
+  constructor() { this.pending = Buffer.alloc(0); this.eventLines = []; this.eventBytes = []; this.eventSize = 0; }
   feed(chunk) {
     this.pending = Buffer.concat([this.pending, Buffer.from(chunk)]);
     const events = [];
@@ -10,13 +10,19 @@ export class SseParser {
       if (!line) break;
       this.pending = this.pending.subarray(line.bytes);
       const content = line.content.toString('utf8');
-      if (content === '') { if (this.eventBytes.length || this.eventLines.length) this.eventBytes.push(line.raw); const event = this.finishEvent(); if (event) events.push(event); }
-      else if (!content.startsWith(':')) { this.eventLines.push(content); this.eventBytes.push(line.raw); }
-      else this.eventBytes.push(line.raw);
+      this.eventBytes.push(line.raw);
+      this.eventSize += line.bytes;
+      if (content === '') events.push(this.finishEvent());
+      else if (!content.startsWith(':')) this.eventLines.push(content);
     }
     return events;
   }
-  takePending() { const value = this.pending; this.pending = Buffer.alloc(0); return value; }
+  get pendingBytes() { return this.pending.length + this.eventSize; }
+  takePending() {
+    const value = Buffer.concat([...this.eventBytes, this.pending], this.pendingBytes);
+    this.pending = Buffer.alloc(0); this.eventLines = []; this.eventBytes = []; this.eventSize = 0;
+    return value;
+  }
   finish() {
     const events = []; const event = this.finishEvent(); if (event) events.push(event);
     if (this.pending.length) events.push({ raw: this.pending, event: '', data: '', type: '', json: null, incomplete: true });
@@ -33,7 +39,7 @@ export class SseParser {
     const data = fields.data.join('\n'); let json = null;
     if (data && data !== '[DONE]') { try { json = JSON.parse(data); } catch {} }
     const result = { raw, event: fields.event, data, id: fields.id, retry: fields.retry, type: json?.type || fields.event || '', json };
-    this.eventLines = []; this.eventBytes = []; return result;
+    this.eventLines = []; this.eventBytes = []; this.eventSize = 0; return result;
   }
 }
 function findLine(buffer) {

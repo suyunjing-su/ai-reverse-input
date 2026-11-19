@@ -1,4 +1,5 @@
 import { SseParser } from './sse-parser.js';
+import { isEventStream, isIdentityEncoding } from '../http-utils.js';
 
 export function extractResponsesError(payload) {
   if (!payload || typeof payload !== 'object') return null;
@@ -39,14 +40,15 @@ export async function executeResponseRequest({ request, config, upstream, client
     if (remaining <= 0) throw Object.assign(new Error('Responses retry deadline exceeded'), { statusCode: 504 });
     const attempt = createAttemptSignal(clientSignal, remaining);
     try {
-      const response = await upstream(attempt.signal); const stream = Boolean(request.stream);
+      const response = await upstream(attempt.signal);
+      const stream = request.stream || (request.inspectStreamErrors === true && isEventStream(response.headers));
       if (!stream) {
         const result = await readResponse(response, maxResponseBodyBytes, attempt.signal); const error = parseResponseError(response.statusCode, result.body); const match = matchesStatus(response.statusCode, config) || (request.inspectStreamErrors !== false ? matchesRetry(error, config) : null); const delay = match ? backoffDelay(config, retryCount + 1) : 0;
         if (match && retryCount < config.maxRetries && withinDeadline(started, config.totalTimeoutMs) && delay < (config.totalTimeoutMs - (Date.now() - started))) { retryCount++; onRetry(match, retryCount); await retryDelay(delay, clientSignal); continue; }
         if (match && (retryCount >= config.maxRetries || !withinDeadline(started, config.totalTimeoutMs))) onExhausted(); else if (retryCount) onSuccess();
         return { response, body: result.body, retryCount };
       }
-      if (request.inspectStreamErrors === false) {
+      if (request.inspectStreamErrors === false || !isEventStream(response.headers) || !isIdentityEncoding(response.headers)) {
         const statusMatch = matchesStatus(response.statusCode, config);
         if (statusMatch && retryCount < config.maxRetries && withinDeadline(started, config.totalTimeoutMs) && backoffDelay(config, retryCount + 1) < (config.totalTimeoutMs - (Date.now() - started))) {
           response.destroy(); retryCount++; onRetry(statusMatch, retryCount); await retryDelay(backoffDelay(config, retryCount), clientSignal); continue;
@@ -103,7 +105,7 @@ async function handleStreamAttempt(response, config, signal, started, retryCount
         if (error && candidate) matched = candidate;
         if (isSubstantive(event) || isTerminal(event) || prefixBytes >= config.preflightBytes) passthrough = true;
       }
-      if (passthrough || prefixBytes >= config.preflightBytes) return { retry: false, response, prefix, rest: parser.takePending(), iterator: handoffIterator(pendingNext, iterator), match: matched };
+      if (passthrough || prefixBytes + parser.pendingBytes >= config.preflightBytes) return { retry: false, response, prefix, rest: parser.takePending(), iterator: handoffIterator(pendingNext, iterator), match: matched };
     }
     if (!passthrough) {
       for (const event of parser.finish()) {

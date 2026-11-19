@@ -5,6 +5,10 @@ import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { gzipSync } from 'node:zlib';
+import { SseParser } from '../src/retry/sse-parser.js';
+
+function parseEvents(body) { return new SseParser().feed(body).flatMap((event) => event.json ? [event.json] : []); }
 function listen(server) { return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port))); }
 async function freePort() { const server = http.createServer(); const port = await listen(server); await new Promise((resolve) => server.close(resolve)); return port; }
 function request(port, pathName, options = {}, body = '') { return new Promise((resolve, reject) => { const req = http.request({ hostname: '127.0.0.1', port, path: pathName, method: options.method || 'GET', headers: options.headers || {} }, (res) => { const chunks = []; res.on('data', (chunk) => chunks.push(chunk)); res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) })); }); req.once('error', reject); req.end(body); }); }
@@ -21,6 +25,13 @@ test('server authenticates admin, hot-applies prompt rules, and forwards safely'
       const first = attempts.filter((attempt) => attempt.url === seen.url).length === 1;
       res.writeHead(first ? 429 : 200, { 'content-type': 'text/event-stream' });
       res.end(first ? 'retry me' : 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1"}}\n\n');
+    } else if (req.url === '/api/v1/responses?compat=gzip') {
+      const first = attempts.filter((attempt) => attempt.url === seen.url).length === 1;
+      const sse = first ? 'data: {"type":"error","error":{"code":"busy","message":"discard me"}}\n\n' :
+        'event: response.created\r\ndata: {"type":"response.created",\r\ndata: "response":{"id":"resp_gzip","status":"in_progress"}}\r\n\r\n';
+      const compressed = gzipSync(sse);
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'content-encoding': 'gzip', 'content-length': compressed.length, etag: '"compressed"' });
+      res.end(compressed);
     } else if (req.url === '/api/v1/responses?compat=direct') {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.end('event: response.created\r\ndata: {"type":"response.created","response":{"id":"resp_direct","status":"in_progress"}}\r\n\r\n');
@@ -61,8 +72,14 @@ test('server authenticates admin, hot-applies prompt rules, and forwards safely'
   assert.equal(compatResponse.status, 200);
   assert.match(compatResponse.body.toString(), /"model":"alpha"/);
 
-  const retrySettings = await request(reservation, '/admin/api/retry', { method: 'PUT', headers: { cookie, 'content-type': 'application/json' } }, JSON.stringify({ enabled: true, maxRetries: 1, baseDelayMs: 0 }));
+  const retrySettings = await request(reservation, '/admin/api/retry', { method: 'PUT', headers: { cookie, 'content-type': 'application/json' } }, JSON.stringify({ enabled: true, maxRetries: 1, baseDelayMs: 0, codeRules: [{ value: 'busy', mode: 'exact', enabled: true }] }));
   assert.equal(retrySettings.status, 200);
+
+  const gzipResponse = await post('/v1/responses?compat=gzip', JSON.stringify({ model: 'gzip-model', input: 'hello' }));
+  assert.equal(gzipResponse.status, 200);
+  for (const header of ['content-encoding', 'content-length', 'etag']) assert.equal(gzipResponse.headers[header], undefined);
+  assert.deepEqual(parseEvents(gzipResponse.body), [{ type: 'response.created', response: { id: 'resp_gzip', status: 'in_progress', model: 'gzip-model' } }]);
+  assert.equal(attempts.filter(({ url }) => url === '/api/v1/responses?compat=gzip').length, 2);
   for (const stream of [false, true]) {
     const input = { model: 'alpha', input: 'hello', instructions: 'native Codex', previous_response_id: 'resp_1', stream };
     const url = `/v1/responses?retry=${stream ? 'stream' : 'json'}`;

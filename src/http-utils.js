@@ -5,6 +5,8 @@ export function copyForwardHeaders(headers) { const connectionTokens = new Set(S
 export function normalizePath(pathname) { const value = pathname || '/'; return (value.length > 1 ? value.replace(/\/+$/, '') : value).replace(/\/+/g, '/'); }
 export function isResponsesCreate(req) { const pathname = normalizePath(new URL(req.url, 'http://gateway').pathname); return req.method === 'POST' && /(?:^|\/)v1\/responses$/.test(pathname); }
 export function isStatusRetryEndpoint(req) { const pathname = normalizePath(new URL(req.url, 'http://gateway').pathname); return req.method === 'POST' && /(?:^|\/)v1\/(?:chat\/completions|responses|messages)$/.test(pathname); }
+export function isEventStream(headers) { return String(headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase() === 'text/event-stream'; }
+export function isIdentityEncoding(headers) { const encoding = String(headers['content-encoding'] || '').trim().toLowerCase(); return !encoding || encoding === 'identity'; }
 export function isJsonContentType(value) { return typeof value === 'string' && /^(application\/json|application\/[^;]+\+json)(?:\s*;|$)/i.test(value); }
 export async function readRequestBody(req, maxBytes) { const chunks = []; let total = 0; for await (const chunk of req) { total += chunk.length; if (total > maxBytes) throw Object.assign(new Error('Request body too large'), { statusCode: 413 }); chunks.push(chunk); } return Buffer.concat(chunks); }
 export function sendJson(res, status, payload, onBody) { const body = Buffer.from(JSON.stringify(payload)); res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': body.length, 'cache-control': 'no-store' }); onBody?.(body); res.end(body); }
