@@ -54,6 +54,7 @@ export async function executeResponseRequest({ request, config, upstream, client
           response.destroy(); retryCount++; onRetry(statusMatch, retryCount); await retryDelay(backoffDelay(config, retryCount), clientSignal); continue;
         }
         if (statusMatch && retryCount >= config.maxRetries) onExhausted(); else if (retryCount) onSuccess();
+        if (request.inspectStreamErrors === true && isEventStream(response.headers)) attempt.commitStream();
         await sendStream(response, [], null, attempt.signal, response[Symbol.asyncIterator]());
         return { retryCount };
       }
@@ -64,6 +65,7 @@ export async function executeResponseRequest({ request, config, upstream, client
       const outcome = await handleStreamAttempt(response, config, attempt.signal, started, retryCount, statusMatch, request.inspectStreamErrors !== false);
       if (outcome.retry) { retryCount++; onRetry(outcome.match, retryCount); await retryDelay(backoffDelay(config, retryCount), clientSignal); continue; }
       if ((outcome.match || statusMatch) && retryCount >= config.maxRetries) onExhausted(); else if (retryCount) onSuccess();
+      if (request.inspectStreamErrors === true) attempt.commitStream();
       await sendStream(outcome.response, outcome.prefix, outcome.rest, attempt.signal, outcome.iterator);
       return { retryCount };
     } finally { attempt.dispose(); }
@@ -71,9 +73,9 @@ export async function executeResponseRequest({ request, config, upstream, client
 }
 function createAttemptSignal(parent, timeoutMs) {
   const controller = new AbortController(); const abort = () => controller.abort();
+  let timer = setTimeout(abort, timeoutMs);
   if (parent.aborted) controller.abort(); else parent.addEventListener('abort', abort, { once: true });
-  const timer = setTimeout(abort, timeoutMs);
-  return { signal: controller.signal, dispose() { clearTimeout(timer); parent.removeEventListener('abort', abort); } };
+  return { signal: controller.signal, commitStream() { clearTimeout(timer); timer = null; }, dispose() { if (timer) clearTimeout(timer); parent.removeEventListener('abort', abort); } };
 }
 async function readResponse(response, maxBytes, signal) { const chunks = []; let total = 0; const abort = () => response.destroy?.(Object.assign(new Error('Upstream request timed out'), { name: 'AbortError' })); signal?.addEventListener('abort', abort, { once: true }); try { for await (const chunk of response) { total += chunk.length; if (total > maxBytes) throw Object.assign(new Error('Upstream response too large'), { statusCode: 502 }); chunks.push(chunk); } return { body: Buffer.concat(chunks) }; } finally { signal?.removeEventListener('abort', abort); } }
 function parseResponseError(statusCode, body) { try { const json = JSON.parse(body.toString('utf8')); return extractResponsesError(json); } catch { return null; } }

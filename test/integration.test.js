@@ -10,6 +10,38 @@ function responseFromChunks(statusCode, chunks, headers = { 'content-type': 'tex
 function ReadableFromChunks(chunks) { return { async *[Symbol.asyncIterator]() { for (const chunk of chunks) { await new Promise((r) => setTimeout(r, 1)); yield Buffer.from(chunk); } } }; }
 const retryConfig = { enabled: true, statusRules: [], codeRules: [{ value: 'busy', mode: 'exact', enabled: true }], messageRules: [], maxRetries: 1, baseDelayMs: 0, maxDelayMs: 0, exponentialBackoff: false, totalTimeoutMs: 1000, preflightBytes: 64 * 1024, preflightMs: 1000 };
 
+test('a reply committed as Responses SSE retains client cancellation, not retry deadline', async () => {
+  const client = new AbortController();
+  const added = 'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":""}}\n\n';
+  let attempts = 0;
+  await executeResponseRequest({
+    request: { stream: true, inspectStreamErrors: true },
+    config: { ...retryConfig, totalTimeoutMs: 100, preflightMs: 100 },
+    clientSignal: client.signal,
+    upstream: async () => { attempts++; return responseFromChunks(200, [added]); },
+    sendStream: async (_response, prefix, _rest, signal) => {
+      assert.equal(Buffer.concat(prefix).toString(), added);
+      await new Promise((resolve) => setTimeout(resolve, 125));
+      assert.equal(signal.aborted, false);
+      client.abort();
+      assert.equal(signal.aborted, true);
+    },
+  });
+  assert.equal(attempts, 1);
+});
+
+test('Responses retry deadline still aborts an attempt that has not returned headers', async () => {
+  await assert.rejects(executeResponseRequest({
+    request: { stream: true, inspectStreamErrors: true },
+    config: { ...retryConfig, totalTimeoutMs: 20 },
+    clientSignal: new AbortController().signal,
+    upstream: (signal) => new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    }),
+    sendStream: () => assert.fail('No response was selected'),
+  }), { name: 'AbortError' });
+});
+
 test('HTTP status code rules retry non-stream Responses without a JSON error body', async () => {
   let attempts = 0;
   const result = await executeResponseRequest({ request: { stream: false }, config: { ...retryConfig, codeRules: [], statusRules: [{ status: 429, enabled: true }] }, clientSignal: new AbortController().signal, upstream: async () => { attempts++; return { statusCode: attempts === 1 ? 429 : 200, headers: { 'content-type': 'text/plain' }, async *[Symbol.asyncIterator]() { yield Buffer.from(attempts === 1 ? 'temporarily unavailable' : '{"ok":true}'); } }; }, sendStream: async () => {} });

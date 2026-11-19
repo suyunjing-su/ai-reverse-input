@@ -23,7 +23,7 @@ const recentLogs = [];
 const debugCapture = new DebugCapture();
 const loginFailures = new Map();
 const maxSessions = 10000;
-const limits = { maxRequestBodyBytes: positiveIntegerEnv('MAX_REQUEST_BODY_BYTES', 16 * 1024 * 1024, 1024, 256 * 1024 * 1024), maxResponseBodyBytes: positiveIntegerEnv('MAX_RESPONSE_BODY_BYTES', 32 * 1024 * 1024, 1024, 512 * 1024 * 1024) };
+const limits = { maxRequestBodyBytes: positiveIntegerEnv('MAX_REQUEST_BODY_BYTES', 16 * 1024 * 1024, 1024, 256 * 1024 * 1024), maxResponseBodyBytes: positiveIntegerEnv('MAX_RESPONSE_BODY_BYTES', 32 * 1024 * 1024, 1024, 512 * 1024 * 1024), responsesStreamIdleTimeoutMs: positiveIntegerEnv('RESPONSES_STREAM_IDLE_TIMEOUT_MS', 120000, 1000, 3600000) };
 const logger = { info(message, fields = {}) { const entry = { at: new Date().toISOString(), level: 'info', message, ...fields }; recentLogs.push(entry); if (recentLogs.length > 100) recentLogs.shift(); if (process.env.LOG_LEVEL !== 'silent') console.log(JSON.stringify(entry)); }, warn(message, fields = {}) { const entry = { at: new Date().toISOString(), level: 'warn', message, ...fields }; recentLogs.push(entry); if (recentLogs.length > 100) recentLogs.shift(); console.warn(JSON.stringify(entry)); } };
 
 

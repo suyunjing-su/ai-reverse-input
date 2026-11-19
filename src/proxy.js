@@ -37,7 +37,7 @@ export async function handleProxy(req, res, { store, logger, limits, debugCaptur
     const canRetry = config.retry.enabled && (responses || (isStatusRetryEndpoint(req) && config.retry.statusRules?.some((rule) => rule.enabled)));
     const upstream = async (signal = controller.signal) => {
       if (debugId && !signal.aborted) debugCapture.forward(debugId, requestInfo.body, requestInfo.headers);
-      const response = await requestUpstream({ ...requestInfo, signal, timeoutMs: canRetry ? config.retry.totalTimeoutMs : limits.requestTimeoutMs });
+      const response = await requestUpstream({ ...requestInfo, signal, timeoutMs: canRetry ? config.retry.totalTimeoutMs : limits.requestTimeoutMs, streamIdleTimeoutMs: responses ? limits.responsesStreamIdleTimeoutMs : undefined });
       return model && isRepairableSse(response) ? decodeSse(response) : response;
     };
     if (canRetry) {
@@ -61,7 +61,24 @@ export async function handleProxy(req, res, { store, logger, limits, debugCaptur
 
 function parseJson(body) { try { return JSON.parse(body.toString('utf8')); } catch { return null; } }
 export function buildTarget(upstreamBase, clientUrl) { const base = new URL(upstreamBase); const incoming = new URL(clientUrl, 'http://gateway'); const prefix = base.pathname.replace(/\/+$/, ''); const suffix = incoming.pathname.replace(/^\/+/, ''); const pathname = `${prefix}/${suffix}`.replace(/\/+/g, '/') || '/'; return new URL(`${pathname}${incoming.search}`, base.origin); }
-function requestUpstream({ target, method, headers, body, signal, timeoutMs }) { return new Promise((resolve, reject) => { const client = target.protocol === 'https:' ? https : http; const request = client.request(target, { method, headers, signal, timeout: timeoutMs }, (response) => resolve(response)); request.once('error', reject); request.once('timeout', () => request.destroy(Object.assign(new Error('Upstream timeout'), { statusCode: 504 }))); if (body.length) request.write(body); request.end(); }); }
+function requestUpstream({ target, method, headers, body, signal, timeoutMs, streamIdleTimeoutMs }) {
+  return new Promise((resolve, reject) => {
+    const client = target.protocol === 'https:' ? https : http;
+    const timeoutError = () => Object.assign(new Error('Upstream timeout'), { statusCode: 504 });
+    const request = client.request(target, { method, headers, signal, timeout: timeoutMs }, (response) => {
+      if (streamIdleTimeoutMs && isEventStream(response.headers)) {
+        request.removeListener('timeout', onRequestTimeout);
+        response.setTimeout(streamIdleTimeoutMs, () => response.destroy(timeoutError()));
+      }
+      resolve(response);
+    });
+    const onRequestTimeout = () => request.destroy(timeoutError());
+    request.once('error', reject);
+    request.once('timeout', onRequestTimeout);
+    if (body.length) request.write(body);
+    request.end();
+  });
+}
 const REWRITTEN_BODY_HEADERS = new Set(['content-length', 'content-md5', 'digest', 'content-digest', 'repr-digest', 'etag']);
 
 function writeResponseHeaders(res, response, onHeaders, rewritten = false) {
@@ -85,7 +102,8 @@ function decodeSse(response) {
   const decoded = createDecoder();
   const headers = { ...response.headers };
   delete headers['content-encoding']; delete headers['content-length']; delete headers.etag;
-  response.pipe(decoded);
+  // Propagate upstream errors to the decoder, and tear down upstream on abort.
+  pipeline(response, decoded, () => {});
   decoded.statusCode = response.statusCode; decoded.headers = headers;
   return decoded;
 }
@@ -100,22 +118,9 @@ async function sendStreamResponse(res, response, prefix, rest, signal, iterator,
   signal.throwIfAborted();
   const transform = model && isRepairableSse(response) && isIdentityEncoding(response.headers) ? new ResponsesSseCompatibility(model) : null;
   writeResponseHeaders(res, response, onHeaders, Boolean(transform));
-  const write = async (chunk) => {
-    const output = transform ? transform.transform(chunk) : chunk;
-    if (!output.length) return;
-    onBody?.(output);
-    if (!res.write(output)) await waitDrain(res, signal);
-  };
-  for (const chunk of prefix) await write(chunk);
-  if (rest?.length) await write(rest);
-  const iterable = iterator ? { [Symbol.asyncIterator]: () => iterator, destroy: () => response.destroy() } : response;
+  const iterable = iterator ? {
+    [Symbol.asyncIterator]: () => responseChunks(prefix, rest, iterator),
+    destroy: () => response.destroy(),
+  } : response;
   await pipeWithAbort(iterable, res, signal, onBody, transform);
-}
-
-function waitDrain(res, signal) {
-  return new Promise((resolve, reject) => {
-    const done = () => { signal.removeEventListener('abort', abort); resolve(); };
-    const abort = () => { res.removeListener('drain', done); reject(Object.assign(new Error('Request aborted'), { name: 'AbortError' })); };
-    res.once('drain', done); signal.addEventListener('abort', abort, { once: true });
-  });
 }
