@@ -23,8 +23,12 @@ function matchesRule(value, rule) { if (typeof value !== 'string') return false;
 export function eventError(event) { const error = extractResponsesError(event.json); if (error) return error; if (event.type === 'error' && event.json && typeof event.json === 'object') return extractResponsesError({ error: event.json.error || event.json }); return null; }
 export function isTerminal(event) { return ['response.completed', 'response.incomplete', 'response.failed', 'error'].includes(event.type) || event.data === '[DONE]'; }
 export function isSubstantive(event) {
-  if (!event?.type || !event.type.startsWith('response.')) return false;
-  return !['response.created', 'response.queued', 'response.in_progress', 'response.completed', 'response.incomplete', 'response.failed'].includes(event.type);
+  const type = event?.type || '';
+  const jsonType = event?.jsonType || '';
+  const effective = type || jsonType;
+  if (effective === 'error' || effective === 'response.failed') return false;
+  if (['response.created', 'response.queued', 'response.in_progress', 'response.completed', 'response.incomplete'].includes(effective)) return false;
+  return type.startsWith('response.') || jsonType.startsWith('response.') || jsonType === 'function_call' || jsonType === 'computer_call' || jsonType === 'custom_tool_call';
 }
 export function backoffDelay(config, retryIndex) { const raw = config.exponentialBackoff ? config.baseDelayMs * (2 ** Math.max(0, retryIndex - 1)) : config.baseDelayMs; return Math.min(config.maxDelayMs, raw); }
 export async function retryDelay(ms, signal) {

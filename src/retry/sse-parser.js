@@ -38,7 +38,7 @@ export class SseParser {
     }
     const data = fields.data.join('\n'); let json = null;
     if (data && data !== '[DONE]') { try { json = JSON.parse(data); } catch {} }
-    const result = { raw, event: fields.event, data, id: fields.id, retry: fields.retry, type: json?.type || fields.event || '', json };
+    const result = { raw, event: fields.event, data, id: fields.id, retry: fields.retry, type: fields.event || json?.type || '', jsonType: json?.type || '', json };
     this.eventLines = []; this.eventBytes = []; this.eventSize = 0; return result;
   }
 }

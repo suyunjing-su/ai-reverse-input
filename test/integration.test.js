@@ -42,6 +42,12 @@ test('Responses retry deadline still aborts an attempt that has not returned hea
   }), { name: 'AbortError' });
 });
 
+test('an SSE tool event remains substantive when event name and JSON type differ', async () => {
+  let attempts = 0; const delivered = [];
+  await executeResponseRequest({ request: { stream: true }, config: retryConfig, clientSignal: new AbortController().signal, upstream: async () => { attempts++; return responseFromChunks(200, ['event: response.output_item.added\ndata: {"type":"function_call","call_id":"call_1"}\n\nevent: response.failed\ndata: {"type":"response.failed","response":{"error":{"code":"busy"}}}\n\n']); }, sendStream: async (_response, prefix, rest, _signal, iterator) => { delivered.push(...prefix); if (rest?.length) delivered.push(rest); for await (const chunk of { [Symbol.asyncIterator]: () => iterator }) delivered.push(chunk); } });
+  assert.equal(attempts, 1);
+  assert.match(Buffer.concat(delivered).toString(), /response\.output_item\.added/);
+});
 test('HTTP status code rules retry non-stream Responses without a JSON error body', async () => {
   let attempts = 0;
   const result = await executeResponseRequest({ request: { stream: false }, config: { ...retryConfig, codeRules: [], statusRules: [{ status: 429, enabled: true }] }, clientSignal: new AbortController().signal, upstream: async () => { attempts++; return { statusCode: attempts === 1 ? 429 : 200, headers: { 'content-type': 'text/plain' }, async *[Symbol.asyncIterator]() { yield Buffer.from(attempts === 1 ? 'temporarily unavailable' : '{"ok":true}'); } }; }, sendStream: async () => {} });
