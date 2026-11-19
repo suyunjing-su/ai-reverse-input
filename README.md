@@ -5,6 +5,7 @@
 ## 特性
 
 - Responses 流式重试的总时限只用于选择/切换尝试；一旦开始向客户端交付正常 SSE，流不会因为该重试预算到期而被截断。`RESPONSES_STREAM_IDLE_TIMEOUT_MS`（默认 120000）仅限制上游连续无数据的空闲时间，客户端断开仍会立即中止。
+- Responses 流式兼容：为缺少 `response.model` 的 `response.created` / `response.in_progress` 补入请求模型；为缺少 `item.status` 的 `response.output_item.done` 函数调用补入 `completed`。不覆盖已有值，不改工具 ID、参数或结果。
 - 对三个创建接口按协议追加系统提示词，不改写用户输入、多模态内容或工具调用：
   - `POST /v1/messages`：追加到 `system` 字符串，或在 `system` 数组末尾追加独立文本块；保留原有块与 `cache_control`。
   - `POST /v1/responses`：追加到 `instructions` 字符串；带 `previous_response_id` 的请求也独立处理，不读取历史轮次。

@@ -1,5 +1,6 @@
 const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
 const MODEL_EVENTS = new Set(['response.created', 'response.in_progress']);
+const OUTPUT_ITEM_DONE = 'response.output_item.done';
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 
 export class ResponsesSseCompatibility {
@@ -82,9 +83,7 @@ function repairFrame(frame, model) {
   if (!data.length) return frame;
   let event;
   try { event = JSON.parse(utf8.decode(Buffer.from(data.map(({ value }) => value).join('\n'), 'latin1'))); } catch { return frame; }
-  const response = event?.response;
-  if (!MODEL_EVENTS.has(event?.type) || !response || typeof response !== 'object' || Array.isArray(response) || response.model != null) return frame;
-  response.model = model;
+  if (!repairEvent(event, model)) return frame;
   const output = [];
   let offset = 0;
   for (const [index, { match }] of data.entries()) {
@@ -96,4 +95,18 @@ function repairFrame(frame, model) {
   }
   output.push(frame.subarray(offset));
   return Buffer.concat(output);
+}
+
+function repairEvent(event, model) {
+  const response = event?.response;
+  if (MODEL_EVENTS.has(event?.type) && response && typeof response === 'object' && !Array.isArray(response) && response.model == null) {
+    response.model = model;
+    return true;
+  }
+  const item = event?.item;
+  if (event?.type === OUTPUT_ITEM_DONE && item?.type === 'function_call' && item.status === undefined) {
+    item.status = 'completed';
+    return true;
+  }
+  return false;
 }

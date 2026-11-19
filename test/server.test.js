@@ -9,6 +9,19 @@ import { gzipSync } from 'node:zlib';
 import { SseParser } from '../src/retry/sse-parser.js';
 
 function parseEvents(body) { return new SseParser().feed(body).flatMap((event) => event.json ? [event.json] : []); }
+
+const toolArguments = '{"location":"San Francisco"}';
+const toolCall = { id: 'fc_1', type: 'function_call', call_id: 'call_1', name: 'get_weather', arguments: toolArguments };
+const toolEvents = [
+  { type: 'response.created', response: { id: 'resp_1', status: 'in_progress' } },
+  { type: 'response.output_item.added', output_index: 0, item: { ...toolCall, arguments: '' } },
+  { type: 'response.function_call_arguments.delta', item_id: toolCall.id, output_index: 0, delta: toolArguments.slice(0, 14) },
+  { type: 'response.function_call_arguments.delta', item_id: toolCall.id, output_index: 0, delta: toolArguments.slice(14) },
+  { type: 'response.function_call_arguments.done', item_id: toolCall.id, output_index: 0, arguments: toolArguments },
+  { type: 'response.output_item.done', output_index: 0, item: toolCall },
+  { type: 'response.completed', response: { id: 'resp_1', status: 'completed', output: [toolCall] } },
+].map((event, i) => ({ ...event, sequence_number: i + 1 }));
+const sseFrame = (event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
 function listen(server) { return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port))); }
 async function freePort() { const server = http.createServer(); const port = await listen(server); await new Promise((resolve) => server.close(resolve)); return port; }
 function request(port, pathName, options = {}, body = '') { return new Promise((resolve, reject) => { const req = http.request({ hostname: '127.0.0.1', port, path: pathName, method: options.method || 'GET', headers: options.headers || {} }, (res) => { const chunks = []; res.on('data', (chunk) => chunks.push(chunk)); res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) })); }); req.once('error', reject); req.end(body); }); }
@@ -32,6 +45,10 @@ test('server authenticates admin, hot-applies prompt rules, and forwards safely'
       const compressed = gzipSync(sse);
       res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'content-encoding': 'gzip', 'content-length': compressed.length, etag: '"compressed"' });
       res.end(compressed);
+    } else if (req.url === '/api/v1/responses?compat=tool-call') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(toolEvents.slice(0, 2).map(sseFrame).join(''));
+      res.end(toolEvents.slice(2).map(sseFrame).join(''));
     } else if (req.url === '/api/v1/responses?compat=direct') {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
       res.end('event: response.created\r\ndata: {"type":"response.created","response":{"id":"resp_direct","status":"in_progress"}}\r\n\r\n');
@@ -72,8 +89,28 @@ test('server authenticates admin, hot-applies prompt rules, and forwards safely'
   assert.equal(compatResponse.status, 200);
   assert.match(compatResponse.body.toString(), /"model":"alpha"/);
 
+  const toolBody = JSON.stringify({ model: 'tool-model', input: 'weather', stream: true });
+  const checkToolStream = async () => {
+    const reply = await post('/v1/responses?compat=tool-call', toolBody);
+    assert.equal(reply.status, 200);
+    const expected = toolEvents.map((event) => {
+      if (event.type === 'response.created') return { ...event, response: { ...event.response, model: 'tool-model' } };
+      if (event.type === 'response.output_item.done') return { ...event, item: { ...event.item, status: 'completed' } };
+      return event;
+    });
+    assert.deepEqual(parseEvents(reply.body), expected);
+    assert.equal(reply.body.toString(), expected.map(sseFrame).join(''));
+  };
+  await checkToolStream();
+
   const retrySettings = await request(reservation, '/admin/api/retry', { method: 'PUT', headers: { cookie, 'content-type': 'application/json' } }, JSON.stringify({ enabled: true, maxRetries: 1, baseDelayMs: 0, codeRules: [{ value: 'busy', mode: 'exact', enabled: true }] }));
   assert.equal(retrySettings.status, 200);
+  await checkToolStream();
+  assert.equal(attempts.filter(({ url }) => url === '/api/v1/responses?compat=tool-call').length, 2);
+
+  const continuation = JSON.stringify({ model: 'tool-model', previous_response_id: 'resp_1', input: [{ type: 'function_call_output', call_id: toolCall.call_id, output: '{"temperature":18}' }] }, null, 2);
+  assert.equal((await post('/v1/responses', continuation)).status, 200);
+  assert.equal(attempts.at(-1).body.toString(), continuation);
 
   const gzipResponse = await post('/v1/responses?compat=gzip', JSON.stringify({ model: 'gzip-model', input: 'hello' }));
   assert.equal(gzipResponse.status, 200);
