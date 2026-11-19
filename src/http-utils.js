@@ -7,7 +7,18 @@ export function isResponsesCreate(req) { const pathname = normalizePath(new URL(
 export function isStatusRetryEndpoint(req) { const pathname = normalizePath(new URL(req.url, 'http://gateway').pathname); return req.method === 'POST' && /(?:^|\/)v1\/(?:chat\/completions|responses|messages)$/.test(pathname); }
 export function isJsonContentType(value) { return typeof value === 'string' && /^(application\/json|application\/[^;]+\+json)(?:\s*;|$)/i.test(value); }
 export async function readRequestBody(req, maxBytes) { const chunks = []; let total = 0; for await (const chunk of req) { total += chunk.length; if (total > maxBytes) throw Object.assign(new Error('Request body too large'), { statusCode: 413 }); chunks.push(chunk); } return Buffer.concat(chunks); }
-export function sendJson(res, status, payload) { const body = Buffer.from(JSON.stringify(payload)); res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': body.length, 'cache-control': 'no-store' }); res.end(body); }
+export function sendJson(res, status, payload, onBody) { const body = Buffer.from(JSON.stringify(payload)); res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': body.length, 'cache-control': 'no-store' }); onBody?.(body); res.end(body); }
 export function safeError(error) { return error instanceof Error ? error.message.slice(0, 200) : 'unknown error'; }
 export function waitForAbort(req, controller) { if (req.destroyed) controller.abort(); else req.once('aborted', () => controller.abort()); }
-export async function pipeWithAbort(readable, res, signal) { const onAbort = () => readable.destroy(new Error('Request aborted')); signal.addEventListener('abort', onAbort, { once: true }); try { for await (const chunk of readable) { if (signal.aborted) break; if (!res.write(chunk)) await once(res, 'drain'); } } finally { signal.removeEventListener('abort', onAbort); } if (!res.writableEnded) res.end(); }
+export async function pipeWithAbort(readable, res, signal, onBody) {
+  const onAbort = () => readable.destroy?.(new Error('Request aborted'));
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    for await (const chunk of readable) {
+      if (signal.aborted || res.destroyed) break;
+      onBody?.(chunk);
+      if (!res.write(chunk)) await once(res, 'drain', { signal });
+    }
+  } finally { signal.removeEventListener('abort', onAbort); }
+  if (!res.writableEnded && !res.destroyed) res.end();
+}

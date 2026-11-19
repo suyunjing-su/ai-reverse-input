@@ -5,6 +5,7 @@ import { promises as fs, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ConfigStore } from './config-store.js';
 import { handleProxy } from './proxy.js';
+import { DebugCapture } from './debug-capture.js';
 import { sendJson, safeError } from './http-utils.js';
 
 loadDotEnv();
@@ -19,6 +20,7 @@ try { validateUpstream(upstream); } catch (error) { console.error(error.message)
 const store = new ConfigStore(dataDir, upstream); await store.init();
 const sessions = new Map();
 const recentLogs = [];
+const debugCapture = new DebugCapture();
 const loginFailures = new Map();
 const maxSessions = 10000;
 const limits = { maxRequestBodyBytes: positiveIntegerEnv('MAX_REQUEST_BODY_BYTES', 16 * 1024 * 1024, 1024, 256 * 1024 * 1024), maxResponseBodyBytes: positiveIntegerEnv('MAX_RESPONSE_BODY_BYTES', 32 * 1024 * 1024, 1024, 512 * 1024 * 1024) };
@@ -53,7 +55,7 @@ async function route(req, res) {
   if (req.method === 'GET' && (url.pathname === '/admin' || url.pathname === '/admin/')) return serveStatic(res, 'admin.html');
   if (req.method === 'GET' && url.pathname === '/') return serveStatic(res, 'admin.html');
   if (url.pathname.startsWith('/assets/')) return serveStatic(res, url.pathname.slice('/assets/'.length));
-  return handleProxy(req, res, { store, logger, limits });
+  return handleProxy(req, res, { store, logger, limits, debugCapture });
 }
 
 function getCookie(req, name) { const value = req.headers.cookie?.split(';').map((part) => part.trim()).find((part) => part.startsWith(`${name}=`)); return value ? decodeURIComponent(value.slice(name.length + 1)) : null; }
@@ -73,6 +75,24 @@ async function adminApi(req, res, url) {
   }
   if (req.method === 'POST' && url.pathname === '/admin/api/logout') { const token = getCookie(req, 'gateway_session'); if (token) sessions.delete(token); const secureCookie = process.env.COOKIE_SECURE === 'true' ? '; Secure' : ''; res.setHeader('set-cookie', `gateway_session=; HttpOnly; SameSite=Strict; Path=/admin; Max-Age=0${secureCookie}`); return sendJson(res, 200, { ok: true }); }
   if (!authenticated(req)) return sendJson(res, 401, { error: { message: 'Authentication required' } });
+  if (url.pathname === '/admin/api/debug') {
+    if (req.method === 'GET') return sendJson(res, 200, debugCapture.list());
+    if (req.method === 'PUT') {
+      const body = await readJson(req, 1024);
+      if (typeof body?.enabled !== 'boolean') return sendJson(res, 400, { error: { message: 'enabled must be a boolean' } });
+      debugCapture.setEnabled(body.enabled);
+      return sendJson(res, 200, debugCapture.list());
+    }
+  }
+  if (url.pathname === '/admin/api/debug/records' && req.method === 'DELETE') {
+    debugCapture.clear();
+    return sendJson(res, 200, debugCapture.list());
+  }
+  const debugMatch = url.pathname.match(/^\/admin\/api\/debug\/records\/([a-f0-9-]{36})$/);
+  if (debugMatch && req.method === 'GET') {
+    const record = debugCapture.get(debugMatch[1]);
+    return record ? sendJson(res, 200, record) : sendJson(res, 404, { error: { message: 'Debug record not found' } });
+  }
   const config = store.snapshot();
   if (req.method === 'GET' && url.pathname === '/admin/api/state') return sendJson(res, 200, publicState(config));
   if (req.method === 'GET' && url.pathname === '/admin/api/logs') return sendJson(res, 200, recentLogs.slice(-100));
