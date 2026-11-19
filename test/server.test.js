@@ -20,7 +20,10 @@ test('server authenticates admin, hot-applies prompt rules, and forwards safely'
     if (req.url === '/api/v1/responses?retry=stream') {
       const first = attempts.filter((attempt) => attempt.url === seen.url).length === 1;
       res.writeHead(first ? 429 : 200, { 'content-type': 'text/event-stream' });
-      res.end(first ? 'retry me' : 'event: response.completed\ndata: {"type":"response.completed"}\n\n');
+      res.end(first ? 'retry me' : 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}\n\nevent: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1"}}\n\n');
+    } else if (req.url === '/api/v1/responses?compat=direct') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end('event: response.created\r\ndata: {"type":"response.created","response":{"id":"resp_direct","status":"in_progress"}}\r\n\r\n');
     } else if (req.url === '/api/v1/responses?retry=json' && attempts.filter((attempt) => attempt.url === seen.url).length === 1) {
       res.writeHead(429, { 'content-type': 'application/json' });
       res.end('{"error":{"message":"retry me"}}');
@@ -53,6 +56,10 @@ test('server authenticates admin, hot-applies prompt rules, and forwards safely'
   const messages = { ...chat, system: [{ type: 'text', text: 'native', cache_control: { type: 'ephemeral' } }], messages: [chat.messages[1]] };
   assert.equal((await post('/v1/messages', JSON.stringify(messages))).status, 200);
   assert.deepEqual(JSON.parse(attempts.at(-1).body), { ...messages, system: [...messages.system, { type: 'text', text: 'RULE' }] });
+  const compatInput = { model: 'alpha', input: 'hello', stream: true };
+  const compatResponse = await post('/v1/responses?compat=direct', JSON.stringify(compatInput));
+  assert.equal(compatResponse.status, 200);
+  assert.match(compatResponse.body.toString(), /"model":"alpha"/);
 
   const retrySettings = await request(reservation, '/admin/api/retry', { method: 'PUT', headers: { cookie, 'content-type': 'application/json' } }, JSON.stringify({ enabled: true, maxRetries: 1, baseDelayMs: 0 }));
   assert.equal(retrySettings.status, 200);
@@ -77,6 +84,6 @@ test('server authenticates admin, hot-applies prompt rules, and forwards safely'
   assert.equal((await request(reservation, '/v1/messages', { headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(original) } }, original)).status, 200);
   assert.equal(attempts.at(-1).body.toString(), original);
   const state = await request(reservation, '/admin/api/state', { headers: { cookie } });
-  assert.equal(JSON.parse(state.body).metrics.promptHits, 4);
-  assert.equal(JSON.parse(state.body).promptRules[0].hits, 4);
+  assert.equal(JSON.parse(state.body).metrics.promptHits, 5);
+  assert.equal(JSON.parse(state.body).promptRules[0].hits, 5);
 });

@@ -4,6 +4,7 @@ import { once } from 'node:events';
 import { detectProtocol, findPromptRule, injectPrompt } from './protocols/prompt-injection.js';
 import { copyForwardHeaders, isJsonContentType, isResponsesCreate, isStatusRetryEndpoint, readRequestBody, safeError, waitForAbort, pipeWithAbort, sendJson } from './http-utils.js';
 import { executeResponseRequest } from './retry/responses-retry.js';
+import { ResponsesSseCompatibility } from './protocols/responses-sse-compat.js';
 
 export async function handleProxy(req, res, { store, logger, limits, debugCapture }) {
   const started = Date.now(); const controller = new AbortController(); waitForAbort(req, controller);
@@ -28,14 +29,16 @@ export async function handleProxy(req, res, { store, logger, limits, debugCaptur
     }
     await store.incrementMetric('requests');
     const target = buildTarget(config.upstreamUrl, req.url); const headers = copyForwardHeaders(req.headers); if (forwardedBody.length) headers['content-length'] = String(forwardedBody.length); else delete headers['content-length'];
-    const requestInfo = { stream: parsed?.stream === true, inspectStreamErrors: isResponsesCreate(req), body: forwardedBody, method: req.method, headers, target };
-    const canRetry = config.retry.enabled && (isResponsesCreate(req) || (isStatusRetryEndpoint(req) && config.retry.statusRules?.some((rule) => rule.enabled)));
+    const responses = isResponsesCreate(req);
+    const requestInfo = { stream: parsed?.stream === true, inspectStreamErrors: responses, body: forwardedBody, method: req.method, headers, target };
+    const sendStream = (response, prefix, rest, signal, iterator) => sendStreamResponse(res, response, prefix, rest, signal, iterator, onHeaders, onBody, responses && requestInfo.stream ? parsed?.model : null);
+    const canRetry = config.retry.enabled && (responses || (isStatusRetryEndpoint(req) && config.retry.statusRules?.some((rule) => rule.enabled)));
     const upstream = (signal = controller.signal) => {
       if (debugId && !signal.aborted) debugCapture.forward(debugId, requestInfo.body, requestInfo.headers);
       return requestUpstream({ ...requestInfo, signal, timeoutMs: canRetry ? config.retry.totalTimeoutMs : limits.requestTimeoutMs });
     };
     if (canRetry && requestInfo.stream) {
-      await executeResponseRequest({ request: requestInfo, config: config.retry, upstream, clientSignal: controller.signal, maxResponseBodyBytes: limits.maxResponseBodyBytes, onRetry: (match, count) => { logger.info('responses retry', { path: '/v1/responses', attempt: count + 1, match: match.kind }); void store.incrementMetric('retries'); }, onSuccess: () => void store.incrementMetric('retrySuccesses'), onExhausted: () => void store.incrementMetric('retryExhausted'), sendStream: (response, prefix, rest, signal, iterator) => sendStreamResponse(res, response, prefix, rest, signal, iterator, onHeaders, onBody) });
+      await executeResponseRequest({ request: requestInfo, config: config.retry, upstream, clientSignal: controller.signal, maxResponseBodyBytes: limits.maxResponseBodyBytes, onRetry: (match, count) => { logger.info('responses retry', { path: '/v1/responses', attempt: count + 1, match: match.kind }); void store.incrementMetric('retries'); }, onSuccess: () => void store.incrementMetric('retrySuccesses'), onExhausted: () => void store.incrementMetric('retryExhausted'), sendStream });
       logger.info('proxy request', { method: req.method, path: pathname, status: res.statusCode || 200, attempts: 'retry-managed', promptHit, durationMs: Date.now() - started });
       return;
     }
@@ -43,7 +46,7 @@ export async function handleProxy(req, res, { store, logger, limits, debugCaptur
       const outcome = await executeResponseRequest({ request: requestInfo, config: config.retry, upstream, clientSignal: controller.signal, maxResponseBodyBytes: limits.maxResponseBodyBytes, onRetry: (match, count) => { logger.info('responses retry', { path: '/v1/responses', attempt: count + 1, match: match.kind }); void store.incrementMetric('retries'); }, onSuccess: () => void store.incrementMetric('retrySuccesses'), onExhausted: () => void store.incrementMetric('retryExhausted'), sendStream: async () => {} });
       writeResponseHeaders(res, outcome.response, onHeaders); onBody?.(outcome.body); res.end(outcome.body); logger.info('proxy request', { method: req.method, path: pathname, status: outcome.response.statusCode, attempts: outcome.retryCount + 1, promptHit, durationMs: Date.now() - started }); return;
     }
-    const response = await upstream(); writeResponseHeaders(res, response, onHeaders); await pipeWithAbort(response, res, controller.signal, onBody);
+    const response = await upstream(); await sendStream(response, [], null, controller.signal);
     logger.info('proxy request', { method: req.method, path: pathname, status: response.statusCode, attempts: 1, promptHit, durationMs: Date.now() - started });
   } catch (error) {
     if (controller.signal.aborted || res.destroyed) return;
@@ -59,14 +62,32 @@ export async function handleProxy(req, res, { store, logger, limits, debugCaptur
 function parseJson(body) { try { return JSON.parse(body.toString('utf8')); } catch { return null; } }
 export function buildTarget(upstreamBase, clientUrl) { const base = new URL(upstreamBase); const incoming = new URL(clientUrl, 'http://gateway'); const prefix = base.pathname.replace(/\/+$/, ''); const suffix = incoming.pathname.replace(/^\/+/, ''); const pathname = `${prefix}/${suffix}`.replace(/\/+/g, '/') || '/'; return new URL(`${pathname}${incoming.search}`, base.origin); }
 function requestUpstream({ target, method, headers, body, signal, timeoutMs }) { return new Promise((resolve, reject) => { const client = target.protocol === 'https:' ? https : http; const request = client.request(target, { method, headers, signal, timeout: timeoutMs }, (response) => resolve(response)); request.once('error', reject); request.once('timeout', () => request.destroy(Object.assign(new Error('Upstream timeout'), { statusCode: 504 }))); if (body.length) request.write(body); request.end(); }); }
-function writeResponseHeaders(res, response, onHeaders) { const headers = {}; const status = response.statusCode || 502; const connectionTokens = new Set(String(response.headers.connection || '').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean)); for (const [key, value] of Object.entries(response.headers)) { const lower = key.toLowerCase(); if (!['connection', 'keep-alive', 'transfer-encoding', 'upgrade'].includes(lower) && !connectionTokens.has(lower)) headers[key] = value; } res.writeHead(status, headers); onHeaders?.(status, headers); }
-async function sendStreamResponse(res, response, prefix, rest, signal, iterator, onHeaders, onBody) {
-  writeResponseHeaders(res, response, onHeaders);
+const REWRITTEN_BODY_HEADERS = new Set(['content-length', 'content-md5', 'digest', 'content-digest', 'repr-digest', 'etag']);
+
+function writeResponseHeaders(res, response, onHeaders, rewritten = false) {
+  const headers = {}; const status = response.statusCode || 502;
+  const connectionTokens = new Set(String(response.headers.connection || '').split(',').map((value) => value.trim().toLowerCase()).filter(Boolean));
+  for (const [key, value] of Object.entries(response.headers)) {
+    const lower = key.toLowerCase();
+    if (!['connection', 'keep-alive', 'transfer-encoding', 'upgrade'].includes(lower) && !connectionTokens.has(lower) && !(rewritten && REWRITTEN_BODY_HEADERS.has(lower))) headers[key] = value;
+  }
+  res.writeHead(status, headers); onHeaders?.(status, headers);
+}
+
+async function sendStreamResponse(res, response, prefix, rest, signal, iterator, onHeaders, onBody, model) {
+  const { statusCode, headers } = response;
+  const encoding = String(headers['content-encoding'] ?? 'identity').trim().toLowerCase();
+  const transform = typeof model === 'string' && model.trim() && statusCode >= 200 && statusCode < 300 && statusCode !== 206 && !headers['content-range'] &&
+    (!encoding || encoding === 'identity') && /^text\/event-stream(?:\s*;|\s*$)/i.test(String(headers['content-type'] || ''))
+    ? new ResponsesSseCompatibility(model) : null;
+  writeResponseHeaders(res, response, onHeaders, Boolean(transform));
   for (const chunk of rest?.length ? [...prefix, rest] : prefix) {
     signal.throwIfAborted();
-    onBody?.(chunk);
-    if (!res.write(chunk)) await once(res, 'drain', { signal });
+    const output = transform ? transform.transform(chunk) : chunk;
+    if (!output.length) continue;
+    onBody?.(output);
+    if (!res.write(output)) await once(res, 'drain', { signal });
   }
   const iterable = iterator ? { [Symbol.asyncIterator]: () => iterator, destroy: () => response.destroy() } : response;
-  await pipeWithAbort(iterable, res, signal, onBody);
+  await pipeWithAbort(iterable, res, signal, onBody, transform);
 }

@@ -4,7 +4,7 @@
 
 ## 特性
 
-- 面板可启用临时 Debug 抓取（默认关闭）：按请求独立记录实际转发正文和发送给客户端的响应正文。记录仅保存在进程内存，最多 20 条；请求和响应各保留最多 256 KiB，超出会标记截断。关闭、清空或重启服务会删除记录；正文可能包含敏感信息，不写入普通日志、不保存认证头和 Cookie。
+- Responses 流式兼容：若上游的 `response.created` 或 `response.in_progress` 缺少 `response.model`，网关会在转发给客户端的边界补入请求中的模型 ID；已有值不覆盖，其他事件和非 Responses 响应不改。
 - 对三个创建接口按协议追加系统提示词，不改写用户输入、多模态内容或工具调用：
   - `POST /v1/messages`：追加到 `system` 字符串，或在 `system` 数组末尾追加独立文本块；保留原有块与 `cache_control`。
   - `POST /v1/responses`：追加到 `instructions` 字符串；带 `previous_response_id` 的请求也独立处理，不读取历史轮次。

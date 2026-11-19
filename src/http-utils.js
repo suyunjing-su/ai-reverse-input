@@ -10,15 +10,19 @@ export async function readRequestBody(req, maxBytes) { const chunks = []; let to
 export function sendJson(res, status, payload, onBody) { const body = Buffer.from(JSON.stringify(payload)); res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': body.length, 'cache-control': 'no-store' }); onBody?.(body); res.end(body); }
 export function safeError(error) { return error instanceof Error ? error.message.slice(0, 200) : 'unknown error'; }
 export function waitForAbort(req, controller) { if (req.destroyed) controller.abort(); else req.once('aborted', () => controller.abort()); }
-export async function pipeWithAbort(readable, res, signal, onBody) {
+export async function pipeWithAbort(readable, res, signal, onBody, transform) {
   const onAbort = () => readable.destroy?.(new Error('Request aborted'));
   signal.addEventListener('abort', onAbort, { once: true });
   try {
     for await (const chunk of readable) {
       if (signal.aborted || res.destroyed) break;
-      onBody?.(chunk);
-      if (!res.write(chunk)) await once(res, 'drain', { signal });
+      const output = transform ? transform.transform(chunk) : chunk;
+      if (!output.length) continue;
+      onBody?.(output);
+      if (!res.write(output)) await once(res, 'drain', { signal });
     }
+    const final = transform?.flush?.() ?? Buffer.alloc(0);
+    if (final.length && !signal.aborted && !res.destroyed) { onBody?.(final); if (!res.write(final)) await once(res, 'drain', { signal }); }
   } finally { signal.removeEventListener('abort', onAbort); }
   if (!res.writableEnded && !res.destroyed) res.end();
 }
