@@ -1,12 +1,15 @@
 # New API Reserve Input Gateway
 
-独立的 HTTP 反向代理：保留 New API 的鉴权、渠道、额度和上游路由，只在精确命中规则时改写模型用户输入，并可对 OpenAI Responses 创建端点执行显式配置的错误重试。
+独立的 HTTP 反向代理：保留 New API 的鉴权、渠道、额度和上游路由。命中模型规则时，在原有系统指令之后追加固定提示词；也可按配置重试指定的上游错误。
 
 ## 特性
 
 - 默认透明转发：未命中规则的请求体按原始字节发送。
-- Chat Completions、Responses、Anthropic Messages 的独立提示词适配器。
-- 只修改最后一个实际 `user` 消息中的文本，保留系统消息、多模态内容和其他字段。
+- 对三个创建接口按协议追加系统提示词，不改写用户输入、多模态内容或工具调用：
+  - `POST /v1/messages`：追加到 `system` 字符串，或在 `system` 数组末尾追加独立文本块；保留原有块与 `cache_control`。
+  - `POST /v1/responses`：追加到 `instructions` 字符串；带 `previous_response_id` 的请求也独立处理，不读取历史轮次。
+  - `POST /v1/chat/completions`：在开头连续的 `system` / `developer` 消息之后插入独立消息；存在 `developer` 时沿用该角色，否则使用 `system`。指令和对话交错时原样转发，不重排历史。
+- 未匹配模型、规则停用或提示词为空时不改写。不为 `/v1/chat/completion`、`/v1/completions`、模型列表或 token 计数请求注入。
 - Responses 非流式错误重试，以及有界 SSE 前置阶段重试；不会缓存整段正常 SSE。
 - JSON 文件持久化，无需外部数据库；配置快照在单次请求内保持一致。
 - 管理面板和 cookie 会话认证；密码使用 Node `scrypt` 哈希，日志不记录密钥、提示词和响应。

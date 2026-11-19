@@ -10,7 +10,8 @@ export async function handleProxy(req, res, { store, logger, limits }) {
   const config = store.snapshot();
   try {
     const body = await readRequestBody(req, limits.maxRequestBodyBytes);
-    const parsed = parseJson(body); const pathname = new URL(req.url, 'http://gateway').pathname; const protocol = detectProtocol(pathname);
+    const parsed = parseJson(body); const pathname = new URL(req.url, 'http://gateway').pathname;
+    const protocol = req.method === 'POST' ? detectProtocol(pathname) : null;
     const rule = protocol && findPromptRule(config, parsed?.model); let forwardedBody = body; let promptHit = false;
     if (rule && (!req.headers['content-type'] || isJsonContentType(req.headers['content-type']))) {
       const injected = injectPrompt(body, protocol, rule); if (injected.changed) { forwardedBody = injected.body; promptHit = true; await store.update((next) => { const target = next.promptRules.find((item) => item.id === rule.id); if (target) target.hits = (target.hits || 0) + 1; next.metrics.promptHits = (next.metrics.promptHits || 0) + 1; }); }
