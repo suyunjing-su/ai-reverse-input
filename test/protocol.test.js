@@ -32,18 +32,28 @@ test('chat injection uses system when only system exists or no instruction exist
   assert.deepEqual(JSON.parse(withoutInstruction.body).messages, [{ role: 'system', content: 'RULE' }, { role: 'user', content: 'hello' }]);
 });
 
-test('injects Responses instructions and preserves input, tools, and previous response state', () => {
-  const original = { model: 'x', instructions: 'native', input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }], tools: [{ type: 'function' }], reasoning: { effort: 'high' }, previous_response_id: 'resp_1' };
-  const result = injectPrompt(Buffer.from(JSON.stringify(original)), 'responses', { prompt: 'P' });
+test('injects Responses developer input without changing instructions or native history', () => {
+  const original = { model: 'x', instructions: 'native instructions', input: [{ role: 'developer', content: 'native developer' }, { role: 'user', content: 'AGENTS instructions' }, { role: 'user', content: [{ type: 'input_text', text: 'task' }] }], previous_response_id: 'resp_1', reasoning: { effort: 'high' }, tools: [{ type: 'function' }], tool_choice: 'auto', include: ['x'], metadata: { trace: 'a' }, stream: true };
+  const result = injectPrompt(Buffer.from(JSON.stringify(original)), 'responses', { prompt: 'GATEWAY' });
   const value = JSON.parse(result.body);
-  assert.equal(value.instructions, 'native\n\nP');
-  assert.deepEqual(value.input, original.input);
-  assert.deepEqual(value.tools, original.tools);
-  assert.deepEqual(value.reasoning, original.reasoning);
-  assert.equal(value.previous_response_id, 'resp_1');
-  assert.equal(injectPrompt(result.body, 'responses', { prompt: 'P' }).changed, false);
-  const absent = injectPrompt(Buffer.from(JSON.stringify({ input: 'hello' })), 'responses', { prompt: 'P' });
-  assert.deepEqual(JSON.parse(absent.body), { input: 'hello', instructions: 'P' });
+  assert.equal(value.instructions, original.instructions);
+  assert.deepEqual(value.input, [original.input[0], { role: 'developer', content: 'GATEWAY' }, original.input[1], original.input[2]]);
+  assert.deepEqual(value.tools, original.tools); assert.deepEqual(value.reasoning, original.reasoning); assert.equal(value.previous_response_id, original.previous_response_id);
+  assert.equal(JSON.stringify(value).includes('base_instructions'), false);
+  const second = injectPrompt(result.body, 'responses', { prompt: 'GATEWAY' });
+  assert.equal(second.changed, false); assert.equal(second.body, result.body);
+});
+
+test('Responses developer injection handles missing, string, empty, tool, and multimodal input', () => {
+  const missing = JSON.parse(injectPrompt(Buffer.from(JSON.stringify({ instructions: 'keep' })), 'responses', { prompt: 'P' }).body);
+  assert.deepEqual(missing, { instructions: 'keep', input: [{ role: 'developer', content: 'P' }] });
+  const stringInput = JSON.parse(injectPrompt(Buffer.from(JSON.stringify({ instructions: 'keep', input: 'task' })), 'responses', { prompt: 'P' }).body);
+  assert.deepEqual(stringInput.input, [{ role: 'developer', content: 'P' }, { role: 'user', content: 'task' }]);
+  const empty = JSON.parse(injectPrompt(Buffer.from(JSON.stringify({ input: [] })), 'responses', { prompt: 'P' }).body);
+  assert.deepEqual(empty.input, [{ role: 'developer', content: 'P' }]);
+  const items = [{ type: 'function_call_output', call_id: 'call_1', output: 'ok' }, { role: 'user', content: [{ type: 'input_image', image_url: 'x' }] }];
+  const value = JSON.parse(injectPrompt(Buffer.from(JSON.stringify({ input: items })), 'responses', { prompt: 'P' }).body);
+  assert.deepEqual(value.input, [{ role: 'developer', content: 'P' }, ...items]);
 });
 
 test('injects Anthropic system while preserving string, blocks, and cache metadata', () => {
@@ -66,6 +76,21 @@ test('empty or disabled prompts are a no-op and unsupported routes are not detec
   assert.equal(detectProtocol('/v1/models'), null);
 });
 
+test('Responses preserves native system/developer prefix and rejects interleaved instructions', () => {
+  const native = [{ role: 'system', content: 'native system' }, { role: 'developer', content: 'native developer' }, { role: 'user', content: 'task' }];
+  const result = injectPrompt(Buffer.from(JSON.stringify({ input: native })), 'responses', { prompt: 'P' });
+  assert.deepEqual(JSON.parse(result.body).input, [native[0], native[1], { role: 'developer', content: 'P' }, native[2]]);
+  const interleaved = [{ role: 'user', content: 'task' }, { role: 'developer', content: 'late developer' }];
+  const unchanged = Buffer.from(JSON.stringify({ input: interleaved }));
+  const noOp = injectPrompt(unchanged, 'responses', { prompt: 'P' });
+  assert.equal(noOp.changed, false);
+  assert.equal(noOp.body, unchanged);
+});
+test('Responses empty or disabled prompts are a no-op', () => {
+  const body = Buffer.from(JSON.stringify({ instructions: 'keep', input: [{ role: 'user', content: 'task' }] }));
+  assert.equal(injectPrompt(body, 'responses', { prompt: '  ' }).changed, false);
+  assert.equal(injectPrompt(body, 'responses', { prompt: 'P', enabled: false }).changed, false);
+});
 test('chat prefers developer in a mixed instruction prefix and preserves tool exchanges', () => {
   const native = [{ role: 'developer', content: 'workflow' }, { role: 'system', content: [{ type: 'text', text: 'identity' }] }];
   const conversation = [
@@ -78,7 +103,7 @@ test('chat prefers developer in a mixed instruction prefix and preserves tool ex
 });
 
 test('missing and empty instructions are initialized without changing unrelated fields', () => {
-  for (const [protocol, field] of [['responses', 'instructions'], ['anthropic', 'system']]) {
+  for (const [protocol, field] of [['anthropic', 'system']]) {
     for (const original of [undefined, null, '']) {
       const request = { [field]: original, cache_control: { type: 'ephemeral' }, previous_response_id: 'resp_2' };
       const injected = injectPrompt(Buffer.from(JSON.stringify(request)), protocol, { prompt: '  P\n' });
@@ -93,11 +118,11 @@ test('missing and empty instructions are initialized without changing unrelated 
 
 test('unexpected instruction formats and interleaved chat instructions are passed through unchanged', () => {
   for (const [protocol, original] of [
-    ['responses', { instructions: ['unexpected'] }],
+    ['responses', { input: { unexpected: true } }],
+    ['responses', { input: 7 }],
     ['anthropic', { system: { text: 'unexpected' } }],
     ['anthropic', { system: [null] }],
     ['chat', { messages: null }],
-    ['chat', { messages: [{ role: 'user', content: 'first' }, { role: 'developer', content: 'late' }] }],
   ]) {
     const body = Buffer.from(JSON.stringify(original, null, 2));
     const result = injectPrompt(body, protocol, { prompt: 'P' });

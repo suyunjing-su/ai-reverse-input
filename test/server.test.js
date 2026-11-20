@@ -126,7 +126,7 @@ test('server authenticates admin, hot-applies prompt rules, and forwards safely'
     const retries = attempts.filter((attempt) => attempt.url === `/api${url}`);
     assert.equal(retries.length, 2);
     assert.deepEqual(retries[0].body, retries[1].body);
-    assert.deepEqual(JSON.parse(retries[0].body), { ...input, instructions: 'native Codex\n\nRULE' });
+    assert.deepEqual(JSON.parse(retries[0].body), { ...input, instructions: 'native Codex', input: [{ role: 'developer', content: 'RULE' }, { role: 'user', content: 'hello' }] });
     assert.deepEqual(retries.map((attempt) => Number(attempt.length)), [retries[0].body.length, retries[0].body.length]);
   }
 

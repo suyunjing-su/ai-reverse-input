@@ -15,7 +15,7 @@ export function injectPrompt(body, protocol, rule) {
   let changed = false;
   switch (protocol) {
     case 'chat': changed = injectChat(value, prompt); break;
-    case 'responses': changed = appendInstruction(value, 'instructions', prompt); break;
+    case 'responses': changed = injectResponses(value, prompt); break;
     case 'anthropic': changed = injectAnthropic(value, prompt); break;
   }
   return changed ? { changed: true, body: Buffer.from(JSON.stringify(value)) } : { changed: false, body };
@@ -39,6 +39,32 @@ function appendInstruction(body, field, prompt) {
   return true;
 }
 
+function injectResponses(body, prompt) {
+  if (body.input === undefined) {
+    body.input = [{ role: 'developer', content: prompt }];
+    return true;
+  }
+  if (typeof body.input === 'string') {
+    body.input = [{ role: 'developer', content: prompt }, { role: 'user', content: body.input }];
+    return true;
+  }
+  if (!Array.isArray(body.input)) return false;
+  if (body.input.some((item) => isGatewayDeveloper(item, prompt))) return false;
+  const insertionIndex = findDeveloperInsertionIndex(body.input);
+  if (body.input.some((item, index) => index > insertionIndex && isInstruction(item))) return false;
+  body.input.splice(insertionIndex, 0, { role: 'developer', content: prompt });
+  return true;
+}
+
+function isGatewayDeveloper(item, prompt) {
+  return item?.role === 'developer' && item.content === prompt && Object.keys(item).length === 2;
+}
+
+function findDeveloperInsertionIndex(input) {
+  let index = 0;
+  while (index < input.length && isInstruction(input[index])) index++;
+  return index;
+}
 function injectAnthropic(body, prompt) {
   if (!Array.isArray(body.system)) return appendInstruction(body, 'system', prompt);
   if (!body.system.every((block) => block?.type === 'text' && typeof block.text === 'string')) return false;
